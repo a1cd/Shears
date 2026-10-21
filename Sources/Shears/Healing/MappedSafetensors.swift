@@ -1,4 +1,8 @@
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 import MLX
 
@@ -63,12 +67,15 @@ public enum MappedSafetensors {
         }
     }
 
+    /// `MAP_FAILED`, which Glibc does not import into Swift.
+    private static let mapFailed = UnsafeMutableRawPointer(bitPattern: -1)
+
     /// Whether this system hands mapped pages to MLX without copying them. Checked once, on one
     /// page of anonymous memory: the wrapped array sees a later write to the page only if it
     /// shares it.
     public static let zeroCopySupported: Bool = {
         let page = Int(getpagesize())
-        guard let p = mmap(nil, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0), p != MAP_FAILED else { return false }
+        guard let p = mmap(nil, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), p != mapFailed else { return false }
         p.storeBytes(of: Float(1), as: Float.self)
         let a = MLXArray(rawPointer: p, [page / 4], dtype: .float32) { munmap(p, page) }
         eval(a)
@@ -85,7 +92,7 @@ public enum MappedSafetensors {
         if zeroCopySupported, e.begin % e.dtype.size == 0 {
             let start = e.begin & ~(page - 1)
             let length = e.end - start
-            if let p = mmap(nil, length, PROT_READ, MAP_SHARED, fd, off_t(start)), p != MAP_FAILED {
+            if let p = mmap(nil, length, PROT_READ, MAP_SHARED, fd, off_t(start)), p != mapFailed {
                 return MLXArray(rawPointer: p.advanced(by: e.begin - start), e.shape, dtype: e.dtype) {
                     munmap(p, length)
                 }
@@ -140,8 +147,7 @@ public enum MappedSafetensors {
         for e in entries where e.end > e.begin {
             var at = e.begin
             while at < e.end {
-                var r = radvisory(ra_offset: off_t(at), ra_count: Int32(min(e.end - at, chunk)))
-                _ = fcntl(fd, F_RDADVISE, &r)
+                ReadAhead.advise(fd: fd, offset: at, count: min(e.end - at, chunk))
                 at += chunk
             }
         }

@@ -1,4 +1,6 @@
+#if canImport(Darwin)
 import Darwin
+#endif
 import Foundation
 
 /// The operating system's view of this process's memory, as opposed to MLX's allocator counters.
@@ -9,6 +11,10 @@ import Foundation
 /// `Memory.peakMemory` only counts bytes MLX's allocator handed out, so the two differ: the
 /// allocator number includes memory-mapped weights (as buffers) and excludes everything else the
 /// process holds (the Swift heap, safetensors readers, the mapped files' page cache).
+///
+/// On Linux the same three numbers come from `/proc/self/status`: `footprint` is `RssAnon + VmSwap`
+/// (anonymous memory, resident or swapped), `fileBacked` is `RssFile + RssShmem`, `anonymous` is
+/// `RssAnon`.
 public enum ProcessMemory {
     public struct Snapshot: Sendable, Equatable {
         /// `phys_footprint` in bytes.
@@ -20,6 +26,7 @@ public enum ProcessMemory {
         public var anonymous: Int
     }
 
+    #if canImport(Darwin)
     public static func snapshot() -> Snapshot {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
@@ -33,4 +40,23 @@ public enum ProcessMemory {
         return Snapshot(
             footprint: Int(info.phys_footprint), fileBacked: Int(info.external), anonymous: Int(info.internal))
     }
+    #else
+    public static func snapshot() -> Snapshot {
+        guard let status = try? String(contentsOfFile: "/proc/self/status", encoding: .utf8) else {
+            return Snapshot(footprint: 0, fileBacked: 0, anonymous: 0)
+        }
+        // Lines look like "RssAnon:\t   12345 kB".
+        var kB: [Substring: Int] = [:]
+        for line in status.split(separator: "\n") {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let fields = line[line.index(after: colon)...].split(whereSeparator: { $0 == " " || $0 == "\t" })
+            if let v = fields.first.flatMap({ Int($0) }) { kB[line[..<colon]] = v }
+        }
+        let anon = (kB["RssAnon"] ?? 0) * 1024
+        return Snapshot(
+            footprint: anon + (kB["VmSwap"] ?? 0) * 1024,
+            fileBacked: ((kB["RssFile"] ?? 0) + (kB["RssShmem"] ?? 0)) * 1024,
+            anonymous: anon)
+    }
+    #endif
 }

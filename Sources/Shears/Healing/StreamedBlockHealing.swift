@@ -275,8 +275,7 @@ public final class DiskBoundaryStore: BoundaryStore {
             defer { close(fd) }
             var st = stat()
             guard fstat(fd, &st) == 0, st.st_size > 0 else { return }
-            var r = radvisory(ra_offset: 0, ra_count: Int32(clamping: st.st_size))
-            _ = fcntl(fd, F_RDADVISE, &r)
+            ReadAhead.advise(fd: fd, offset: 0, count: Int(st.st_size))
         }
     }
     private static let prefetchQueue = DispatchQueue(label: "shears.state-prefetch", qos: .utility)
