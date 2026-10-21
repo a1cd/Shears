@@ -1,4 +1,6 @@
+#if canImport(Darwin)
 import Darwin
+#endif
 import Foundation
 import MLX
 import MLXNN
@@ -56,16 +58,23 @@ final class PrepareMemoryBenchmark: ShearsTestCase {
     }
 
     static func lifetimeMaxFootprint() -> Int {
+        #if canImport(Darwin)
         var info = rusage_info_v6()
         let rc = withUnsafeMutablePointer(to: &info) { p in
             p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V6, $0) }
         }
         return rc == 0 ? Int(info.ri_lifetime_max_phys_footprint) : 0
+        #else
+        return 0
+        #endif
     }
 
     func testPrepareFootprint() throws {
         let env = ProcessInfo.processInfo.environment
         try XCTSkipUnless(env["SHEARS_BENCH"] == "1", "set TEST_RUNNER_SHEARS_BENCH=1")
+        #if !canImport(Darwin)
+        throw XCTSkip("reports proc_pid_rusage's lifetime peak footprint, which only macOS has")
+        #endif
         let layers = Int(env["SHEARS_PREP_LAYERS"] ?? "") ?? 6
         let nRows = Int(env["SHEARS_PREP_ROWS"] ?? "") ?? 24
         let blockLayers = Int(env["SHEARS_PREP_BLOCK"] ?? "") ?? 3

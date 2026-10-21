@@ -1,4 +1,8 @@
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+#endif
 import Foundation
 import MLX
 import MLXNN
@@ -19,7 +23,11 @@ final class ResidencyBenchmarkTests: ShearsTestCase {
     static let layers = 6
     func cpuSeconds() -> Double {
         var u = rusage()
+        #if canImport(Darwin)
         getrusage(RUSAGE_SELF, &u)
+        #else
+        getrusage(Int32(RUSAGE_SELF.rawValue), &u)
+        #endif
         func s(_ t: timeval) -> Double { Double(t.tv_sec) + Double(t.tv_usec) / 1e6 }
         return s(u.ru_utime) + s(u.ru_stime)
     }

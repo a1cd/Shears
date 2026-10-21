@@ -8,6 +8,14 @@ import XCTest
 
 /// Caps MLX's memory and buffer cache so the suite can run alongside other GPU work
 /// without competing for unified memory.
+#if !canImport(ObjectiveC)
+extension ShearsTestCase {
+    /// corelibs XCTest has no `init()`. Some tests make an instance of another case only to call its
+    /// helpers; this gives that instance a name and an empty body.
+    convenience init() { self.init(name: "helper", testClosure: { _ in }) }
+}
+#endif
+
 class ShearsTestCase: XCTestCase {
     override func setUp() {
         super.setUp()

@@ -221,7 +221,11 @@ final class FusedSitesTests: XCTestCase {
         for i in [0, 1, 2, 9, 10, 11, 20, 21, 27, 31, 40, 41, 42, 43, 44] { expected[i] = false }
         for i in 0 ..< 40 { expected[100 + i] = expected[i] }
         XCTAssertEqual(before, expected)
+        #if canImport(ObjectiveC)
         let oracle = KQuantOracleTests()
+        #else
+        let oracle = KQuantOracleTests(name: "helper", testClosure: { _ in })
+        #endif
         try oracle.search("probe", type: "q4_k", im: false, sites: [5, 6, 7], mismatches: { fmaSites[5] ? 1 : 0 })
         try oracle.greedy("probe", sites: [5, 6, 7], mismatches: { fmaSites[6] ? 1 : 0 })
         XCTAssertEqual(fmaSites, before, "the searches changed the global fused-site pattern")

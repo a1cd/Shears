@@ -1,8 +1,27 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import MLX
 import XCTest
 
 @testable import Shears
+
+#if canImport(Darwin)
+import Darwin
+
+private let posixConnect = Darwin.connect
+private let posixClose = Darwin.close
+private let posixSend = Darwin.send
+private let streamSocket = SOCK_STREAM
+#else
+import Glibc
+
+private let posixConnect = Glibc.connect
+private let posixClose = Glibc.close
+private let posixSend = Glibc.send
+private let streamSocket = Int32(SOCK_STREAM.rawValue)
+#endif
 
 /// Spins up the server on a temporary Unix socket (and on a loopback port) and talks HTTP to it.
 final class InferenceServerTests: ShearsTestCase {
@@ -43,7 +62,7 @@ final class InferenceServerTests: ShearsTestCase {
     // MARK: Client
 
     func connect() throws -> Int32 {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_UNIX, streamSocket, 0)
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutableBytes(of: &addr.sun_path) { buf in
@@ -51,7 +70,7 @@ final class InferenceServerTests: ShearsTestCase {
             buf[socketPath.utf8.count] = 0
         }
         let rc = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { posixConnect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         XCTAssertEqual(rc, 0, "connect \(socketPath)")
         return fd
@@ -60,13 +79,13 @@ final class InferenceServerTests: ShearsTestCase {
     /// One request on a fresh connection, read to the end (`Connection: close`).
     func request(_ method: String, _ path: String, body: String? = nil, raw: Data? = nil, fd given: Int32? = nil) throws -> Response {
         let fd = try given ?? connect()
-        defer { Darwin.close(fd) }
+        defer { posixClose(fd) }
         let payload = raw ?? Data((body ?? "").utf8)
         var head = "\(method) \(path) HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
         if body != nil || raw != nil { head += "Content-Type: application/json\r\nContent-Length: \(payload.count)\r\n" }
         head += "\r\n"
         let data = Data(head.utf8) + payload
-        _ = data.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+        _ = data.withUnsafeBytes { posixSend(fd, $0.baseAddress, $0.count, 0) }
         return Self.readResponse(fd)
     }
 
@@ -305,11 +324,11 @@ final class InferenceServerTests: ShearsTestCase {
 
     func testChunkedRequestBodyAndKeepAlive() throws {
         let fd = try connect()
-        defer { Darwin.close(fd) }
+        defer { posixClose(fd) }
         let body = Data(#"{"max_tokens":2,"temperature":0,"messages":[{"role":"user","content":"a"}]}"#.utf8)
         let head = "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
         let chunked = Data(head.utf8) + Data(String(body.count, radix: 16).utf8) + Data("\r\n".utf8) + body + Data("\r\n0\r\n\r\n".utf8)
-        _ = chunked.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+        _ = chunked.withUnsafeBytes { posixSend(fd, $0.baseAddress, $0.count, 0) }
         // Two requests on one connection: read the first response by its Content-Length, then ask again.
         var got = Data()
         var buf = [UInt8](repeating: 0, count: 65536)
@@ -320,7 +339,7 @@ final class InferenceServerTests: ShearsTestCase {
         }
         XCTAssertTrue(String(decoding: got, as: UTF8.self).hasPrefix("HTTP/1.1 200"))
         let second = "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-        _ = Data(second.utf8).withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
+        _ = Data(second.utf8).withUnsafeBytes { posixSend(fd, $0.baseAddress, $0.count, 0) }
         let r = Self.readResponse(fd)
         XCTAssertEqual(r.status, 200)
     }
