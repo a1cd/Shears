@@ -1,7 +1,11 @@
 import Foundation
 import MLX
 import MLXNN
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 
 /// Computes the teacher once, block by block, and writes everything training needs to a
 /// ``BoundaryStore``; nothing later runs a teacher layer.
