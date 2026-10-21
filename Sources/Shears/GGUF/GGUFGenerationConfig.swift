@@ -20,7 +20,7 @@ public enum GGUFGenerationConfig {
         else { return [] }
 
         func number(_ key: String) -> Double? {
-            guard let n = json[key] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+            guard let n = json[key] as? NSNumber, !n.isBoolean else { return nil }
             return n.doubleValue
         }
         func integer(_ key: String) -> Int32? {
@@ -53,7 +53,7 @@ public enum GGUFGenerationConfig {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
             let ids = json["suppress_tokens"] as? [Any]
         else { return nil }
-        let values = ids.compactMap { ($0 as? NSNumber).flatMap { CFGetTypeID($0) != CFBooleanGetTypeID() ? Int32(exactly: $0.int64Value) : nil } }
+        let values = ids.compactMap { ($0 as? NSNumber).flatMap { !$0.isBoolean ? Int32(exactly: $0.int64Value) : nil } }
         guard values.count == ids.count else { return nil }
         return .array(.int32, values.map { .int32($0) })
     }

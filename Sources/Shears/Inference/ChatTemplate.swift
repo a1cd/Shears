@@ -78,8 +78,8 @@ public struct ChatTemplate: Sendable {
     static func native(_ value: Any) -> Any {
         switch value {
         case let n as NSNumber:
-            if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue }
-            return CFNumberIsFloatType(n) ? n.doubleValue : n.intValue
+            if n.isBoolean { return n.boolValue }
+            return n.isFloatingPoint ? n.doubleValue : n.intValue
         case let d as [String: Any]: return d.mapValues(native)
         case let a as [Any]: return a.map(native)
         default: return value

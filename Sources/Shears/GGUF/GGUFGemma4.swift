@@ -101,7 +101,7 @@ public struct GGUFGemma4Config: Sendable {
         partialRotaryFactorSliding = (rope["partial_rotary_factor"] as? NSNumber)?.doubleValue ?? 1.0
     }
 
-    static func isBool(_ n: NSNumber) -> Bool { CFGetTypeID(n) == CFBooleanGetTypeID() }
+    static func isBool(_ n: NSNumber) -> Bool { n.isBoolean }
 
     public static func load(directory: URL) throws -> GGUFGemma4Config {
         let url = directory.appendingPathComponent("config.json")
