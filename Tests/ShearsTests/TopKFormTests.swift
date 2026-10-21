@@ -14,7 +14,10 @@ final class TopKFormTests: ShearsTestCase {
         return stride(from: 0, to: flat.count, by: k).map { Array(flat[$0 ..< $0 + k]) }
     }
 
-    func testTiesBreakAsInMLXLM() {
+    func testTiesBreakAsInMLXLM() throws {
+        #if !canImport(Darwin)
+        throw XCTSkip("the expected orders are Metal's argPartition tie-breaking; MLX's CPU backend breaks ties differently")
+        #endif
         let x = MLXArray([
             1, 3, 3, 2, 3, 0,
             5, 5, 5, 5, 5, 5,

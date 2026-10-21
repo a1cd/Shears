@@ -66,6 +66,18 @@ final class RunnerTests: ShearsTestCase {
         try loadArrays(url: dir.appendingPathComponent("out/stage-\(stage)/adapters.safetensors"))
     }
 
+    /// Writes the sample workspace (tiny model, rows, config) to `SHEARS_SAMPLE_WORKSPACE`, so the
+    /// `shears-cli` binary can be run on it by hand. Off by default.
+    func testWriteSampleWorkspace() throws {
+        guard let out = ProcessInfo.processInfo.environment["SHEARS_SAMPLE_WORKSPACE"] else {
+            throw XCTSkip("set SHEARS_SAMPLE_WORKSPACE to a directory to write the sample workspace there")
+        }
+        let dir = try workspace()
+        let dest = URL(fileURLWithPath: out)
+        try? FileManager.default.removeItem(at: dest)
+        try FileManager.default.copyItem(at: dir, to: dest)
+    }
+
     func testSampleConfigRunsEveryCommandEndToEnd() throws {
         let dir = try workspace()
         let cfg = try config(dir)

@@ -193,6 +193,11 @@ final class ResidencyTests: ShearsTestCase {
     // MARK: memory-mapped weights
 
     func testMappedLayerSharesTheFilesPages() throws {
+        #if !canImport(Darwin)
+        try XCTSkipUnless(
+            MappedSafetensors.zeroCopySupported,
+            "only MLX's Metal allocator wraps external memory; the CPU and CUDA allocators copy it, so nothing is mapped")
+        #endif
         let s = try setup(layers: 2, keepCount: 8)
         let cp = try Gemma4Checkpoint(directory: s.checkpoint)
         XCTAssertTrue(MappedSafetensors.zeroCopySupported, "this system copies mapped pages")
@@ -225,6 +230,11 @@ final class ResidencyTests: ShearsTestCase {
     }
 
     func testMappedPagesAreFileBackedAndOutsideTheFootprint() throws {
+        #if !canImport(Darwin)
+        try XCTSkipUnless(
+            MappedSafetensors.zeroCopySupported,
+            "only MLX's Metal allocator wraps external memory; the CPU and CUDA allocators copy it, so nothing is mapped")
+        #endif
         let big = 96 * 1024 * 1024
         let url = try tempDir("map").appendingPathComponent("w.safetensors")
         var header = "{\"w\":{\"dtype\":\"F32\",\"shape\":[\(big / 4)],\"data_offsets\":[0,\(big)]}}"
