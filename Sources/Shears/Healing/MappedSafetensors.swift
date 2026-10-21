@@ -77,8 +77,16 @@ public enum MappedSafetensors {
         let page = Int(getpagesize())
         guard let p = mmap(nil, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), p != mapFailed else { return false }
         p.storeBytes(of: Float(1), as: Float.self)
-        let a = MLXArray(rawPointer: p, [page / 4], dtype: .float32) { munmap(p, page) }
+        final class Released { var value = false }
+        let released = Released()
+        let a = MLXArray(rawPointer: p, [page / 4], dtype: .float32) {
+            released.value = true
+            munmap(p, page)
+        }
         eval(a)
+        // An allocator that cannot wrap the pointer (every one but Metal's) copies the bytes and lets
+        // go of the page at once, so it is already unmapped here.
+        if released.value { return false }
         p.storeBytes(of: Float(2), as: Float.self)
         return a[0].item(Float.self) == 2
     }()
