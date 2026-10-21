@@ -1,4 +1,19 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+
+private let streamSocket = SOCK_STREAM
+/// Darwin turns SIGPIPE off per socket (`SO_NOSIGPIPE`, set on accept).
+private let sendFlags: Int32 = 0
+private let socketSend = Darwin.send
+#else
+import Glibc
+
+private let streamSocket = Int32(SOCK_STREAM.rawValue)
+/// Linux has no `SO_NOSIGPIPE`; each send asks not to raise SIGPIPE instead.
+private let sendFlags = Int32(MSG_NOSIGNAL)
+private let socketSend = Glibc.send
+#endif
 
 /// A minimal HTTP/1.1 server over POSIX sockets, on a Unix socket path or a TCP port.
 ///
@@ -80,7 +95,7 @@ public final class HTTPServer: @unchecked Sendable {
             data.withUnsafeBytes { raw -> Bool in
                 var offset = 0
                 while offset < raw.count {
-                    let n = Darwin.send(fd, raw.baseAddress! + offset, raw.count - offset, 0)
+                    let n = socketSend(fd, raw.baseAddress! + offset, raw.count - offset, sendFlags)
                     if n < 0 {
                         if errno == EINTR { continue }
                         return false
@@ -130,7 +145,7 @@ public final class HTTPServer: @unchecked Sendable {
                 }
                 unlink(path)
             }
-            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            let fd = socket(AF_UNIX, streamSocket, 0)
             guard fd >= 0 else { throw Failure(description: "socket: \(String(cString: strerror(errno)))") }
             var addr = sockaddr_un()
             addr.sun_family = sa_family_t(AF_UNIX)
@@ -151,7 +166,7 @@ public final class HTTPServer: @unchecked Sendable {
             boundPath = path
             listenFD = fd
         case .tcp(let host, let port):
-            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            let fd = socket(AF_INET, streamSocket, 0)
             guard fd >= 0 else { throw Failure(description: "socket: \(String(cString: strerror(errno)))") }
             var one: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
@@ -196,7 +211,7 @@ public final class HTTPServer: @unchecked Sendable {
         running = false
         let open = connections
         lock.unlock()
-        for c in open { shutdown(c, SHUT_RDWR) }
+        for c in open { shutdown(c, Int32(SHUT_RDWR)) }
         // The accept loop notices `running` within its poll interval and closes the descriptor.
         if let p = boundPath {
             unlink(p)
@@ -215,8 +230,10 @@ public final class HTTPServer: @unchecked Sendable {
             if r <= 0 { continue }
             let c = accept(fd, nil, nil)
             if c < 0 { continue }
+            #if canImport(Darwin)
             var on: Int32 = 1
             setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            #endif
             lock.lock()
             connections.insert(c)
             lock.unlock()
