@@ -1,0 +1,20 @@
+diff --git a/Package.swift b/Package.swift
+index ddc839fb..e20d16fa 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -179,7 +179,6 @@ let noCudaCmlxExcludes = [
+                 "mlx-conditional",
+                 "mlx-c/mlx/c/metal.cpp",
+ 
+-                "mlx-c/mlx/c/fast.cpp",  // Exclude on Linux - calls metal_kernel unconditionally
+ 
+             ] + noMetalCmlxExcludes + noCudaCmlxExcludes
+ 
+@@ -196,7 +195,6 @@ let noCudaCmlxExcludes = [
+             "GPU+Metal.swift",
+             "GPU+CUDA.swift",
+             "MLXArray+Metal.swift",
+-            "MLXFast.swift",
+             "MLXFastKernel.swift",
+         ]
+     }
