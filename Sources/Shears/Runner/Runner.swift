@@ -43,6 +43,9 @@ public enum ShearsRunner {
           gguf      convert the exported directory to a GGUF file
           sample    shears-cli sample <dir>: write a tiny random Gemma 4 MoE (model/) and rows.jsonl into <dir>, to try
                     the commands on with Examples/tiny-config.json (copy it to <dir>/config.json). Needs no --config
+          device    shears-cli device: run one small matrix product on MLX's default device and print which device that
+                    was ("mlx device: gpu" or "mlx device: cpu"). Needs no --config. Every other command prints the same
+                    "mlx device:" line first
 
         options of heal:
           --memory-budget <size>    a ceiling on MLX memory, e.g. 3GB or 512MB. It is only checked: the run needs what
@@ -70,6 +73,17 @@ public enum ShearsRunner {
             return 0
         }
         args.removeFirst()
+        if name == "device" {
+            // One real op on the default device, so the answer is "what ran", not "what is installed": a build whose
+            // GPU backend cannot start (no driver, a library of the wrong version) fails here, not later.
+            let device = Device.defaultDevice().deviceType.rawValue
+            let x = MLXArray((0 ..< 16).map { Float($0) }, [4, 4])
+            let product = matmul(x, x)
+            let sum = product.sum().item(Float.self)
+            print("mlx device: \(device)")
+            print("probe: 4x4 matrix product on \(device), sum \(sum) (expected 3920)")
+            return sum == 3920 ? 0 : 1
+        }
         if name == "sample" {
             guard args.count == 1, !args[0].hasPrefix("-") else {
                 FileHandle.standardError.write(Data("usage: shears-cli sample <dir>\n".utf8))
@@ -131,6 +145,7 @@ public enum ShearsRunner {
                 config.stages = config.stages?.map { var s = $0; s.keepIntermediates = keep; return s }
             }
             var env = RunEnvironment()
+            env.log("mlx device: \(Device.defaultDevice().deviceType.rawValue)")
             if installSignalHandlers {
                 let flag = StopSignal.install()
                 env.shouldStop = { flag.requested }

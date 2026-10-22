@@ -1,0 +1,211 @@
+name: Linux CUDA (experimental)
+
+# Builds shears-cli for Linux x86_64 with the MLX CUDA backend and publishes it as a PRE-RELEASE. The runner has no GPU:
+# this only COMPILES. The binary has never been run on a GPU; the Colab notebook is where that first happens.
+# See docs/linux.md. The CPU binary is built by linux.yml and is untouched by this workflow.
+on:
+  push:
+    branches: [cuda-binary, main]
+    paths:
+      - ".github/workflows/linux-cuda.yml"
+      - ".github/scripts/package-linux-cuda.sh"
+      - ".github/actions/setup-linux/**"
+      - "Sources/**"
+      - "CLI/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Notebooks/mlx-swift-linux-cpu.patch"
+  workflow_dispatch:
+
+concurrency:
+  group: linux-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Colab's GPU image (googlecolab/backend-info, 2026): Ubuntu 24.04, CUDA toolkit 13.0, cuDNN 9.x for CUDA 13.
+  # MLX's CMake path refuses exactly CUDA 13.1; 13.0 is what Colab has, so this is what the binary is linked against
+  # (libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libnvrtc.so.13, libcudnn.so.9).
+  CUDA_PACKAGE_VERSION: "13-0"
+  # Pinned to what Colab has. If the NVIDIA repository no longer carries it the step falls back to the newest and says so.
+  CUDNN_VERSION: "9.14.0.64-1"
+  # Device code generated for these compute capabilities: 75 = T4 (Turing), 80 = A100 (also runs on 8.6 and 8.9: L4, A10),
+  # 90 = H100. MLX chooses its sm_80 and sm_90 kernels at run time from the GPU's compute capability, and their bodies exist
+  # only in device code built for an architecture >= 80, so a build for 75 alone would be wrong (not just slow) on an A100.
+  # PTX for the last one lets newer GPUs (Blackwell) compile at first use.
+  SHEARS_CUDA_ARCHS: "75 80 90"
+  # Versions MLX's own CMake build pins for the headers its SwiftPM build does not fetch.
+  CUTLASS_TAG: v4.4.2
+  CUDNN_FRONTEND_TAG: v1.16.0
+  CCCL_TAG: v3.1.3
+
+jobs:
+  build:
+    name: Build shears-cli (CUDA 13.0, compile only, static Swift runtime)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+
+      - uses: ./.github/actions/setup-linux
+
+      - name: CUDA toolkit 13.0 (NVIDIA apt repository)
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            cuda-nvcc-$CUDA_PACKAGE_VERSION cuda-cudart-dev-$CUDA_PACKAGE_VERSION cuda-nvrtc-dev-$CUDA_PACKAGE_VERSION \
+            cuda-driver-dev-$CUDA_PACKAGE_VERSION libcublas-dev-$CUDA_PACKAGE_VERSION cuda-cccl-$CUDA_PACKAGE_VERSION \
+            cuda-cuobjdump-$CUDA_PACKAGE_VERSION cuda-nvdisasm-$CUDA_PACKAGE_VERSION
+          if ! sudo apt-get install -y -qq --no-install-recommends \
+               libcudnn9-dev-cuda-13=$CUDNN_VERSION libcudnn9-cuda-13=$CUDNN_VERSION libcudnn9-headers-cuda-13=$CUDNN_VERSION; then
+            echo "::warning::cuDNN $CUDNN_VERSION is not in the repository any more; installing the newest"
+            sudo apt-get install -y -qq --no-install-recommends libcudnn9-dev-cuda-13
+          fi
+          # The SwiftPM manifest hard-codes /usr/local/cuda.
+          [ -e /usr/local/cuda ] || sudo ln -s /usr/local/cuda-13.0 /usr/local/cuda
+          /usr/local/cuda/bin/nvcc --version
+          ls /usr/local/cuda/include/cccl | head || true
+          dpkg -l | grep -E 'libcudnn|libcublas|cuda-nvrtc|cuda-cudart' | awk '{print $2, $3}'
+          df -h / | tail -1
+
+      - name: Headers the SwiftPM build does not fetch (CUTLASS, cudnn-frontend, CCCL)
+        run: |
+          INC=/usr/local/cuda/include
+          T="$RUNNER_TEMP/cudadeps"; mkdir -p "$T"
+          git clone -q --depth 1 --branch "$CUTLASS_TAG" https://github.com/NVIDIA/cutlass.git "$T/cutlass"
+          sudo cp -r "$T/cutlass/include/cutlass" "$T/cutlass/include/cute" "$INC/"
+          git clone -q --depth 1 --branch "$CUDNN_FRONTEND_TAG" https://github.com/NVIDIA/cudnn-frontend.git "$T/fe"
+          sudo cp -r "$T/fe/include/cudnn_frontend" "$T/fe/include/cudnn_frontend.h" "$INC/"
+          # The toolkit ships its own CCCL under include/cccl; MLX pins another. Overwrite it with the pinned one.
+          curl -fsSL -o "$T/cccl.zip" "https://github.com/NVIDIA/cccl/releases/download/$CCCL_TAG/cccl-$CCCL_TAG.zip"
+          unzip -q "$T/cccl.zip" -d "$T/cccl"
+          CCCL_INC=$(ls -d "$T"/cccl/*/include "$T"/cccl/include 2>/dev/null | head -1)
+          echo "CCCL headers in $CCCL_INC"
+          grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$CCCL_INC/cuda/std/__cccl/" 2>/dev/null | head -3 || true
+          echo "toolkit's own CCCL version:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" 2>/dev/null | head -3 || true
+          sudo mkdir -p "$INC/cccl"
+          sudo cp -r "$CCCL_INC"/. "$INC/cccl/"
+          echo "CCCL now in $INC/cccl:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" | head -3 || true
+          ls "$INC" | grep -E 'cutlass|cute|cudnn_frontend|cccl'
+
+      - name: nvcc wrapper (one architecture list for the compile and the device-link step)
+        run: |
+          # encuda passes a single "-arch sm_NN" to nvcc, for compiling and for the device link. This wrapper replaces it with
+          # one -gencode per architecture in SHEARS_CUDA_ARCHS, so both steps get the same list, and allows the Swift
+          # toolchain's clang as the host compiler even if this nvcc has not heard of its version.
+          mkdir -p "$HOME/nvcc-wrapper"
+          cat > "$HOME/nvcc-wrapper/nvcc" <<'EOF'
+          #!/usr/bin/env bash
+          args=(); skip=0
+          for a in "$@"; do
+            if [ "$skip" = 1 ]; then skip=0; continue; fi
+            if [ "$a" = "-arch" ]; then skip=1; continue; fi
+            args+=("$a")
+          done
+          gen=(); last=""
+          for a in $SHEARS_CUDA_ARCHS; do last=$a; done
+          for a in $SHEARS_CUDA_ARCHS; do
+            if [ "$a" = "$last" ]; then gen+=(-gencode "arch=compute_$a,code=[sm_$a,compute_$a]"); else gen+=(-gencode "arch=compute_$a,code=sm_$a"); fi
+          done
+          exec /usr/local/cuda/bin/nvcc -allow-unsupported-compiler "${gen[@]}" "${args[@]}"
+          EOF
+          chmod +x "$HOME/nvcc-wrapper/nvcc"
+          cat "$HOME/nvcc-wrapper/nvcc"
+
+      - name: swift build shears-cli (CUDA)
+        working-directory: CLI
+        env:
+          SPM_CUDA: "1"
+          CUDA_ARCH: sm_75   # read by encuda; the wrapper above replaces it
+        run: |
+          export PATH="$HOME/nvcc-wrapper:/usr/local/cuda/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          command -v nvcc
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          start=$(date +%s)
+          # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
+          swift build -c release --product shears-cli --static-swift-stdlib --jobs 3
+          echo "release build: $(( $(date +%s) - start )) s"
+
+      - name: Bundle (NVIDIA libraries are not bundled)
+        run: .github/scripts/package-linux-cuda.sh CLI/.build/release/shears-cli
+
+      - name: Run on a machine with no GPU (informational, shows what the failure looks like)
+        continue-on-error: true
+        run: |
+          d=$(mktemp -d); stub=$(mktemp -d)
+          ln -s "$(ls /usr/local/cuda/lib64/stubs/libcuda.so)" "$stub/libcuda.so.1"
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          export LD_LIBRARY_PATH="$stub:/usr/local/cuda/lib64"
+          # Expected to fail (no driver, no device); the message is what a user without a GPU would see.
+          "$d/shears-cli-linux-x86_64-cuda/bin/shears-cli" device || echo "exit status $? (expected on a runner without a GPU)"
+
+      - name: Summary
+        run: |
+          f=dist/shears-cli-linux-x86_64-cuda.tar.gz
+          {
+            echo "### shears-cli, Linux x86_64, CUDA (experimental, never run on a GPU)"
+            echo
+            echo "tarball: $(du -h "$f" | cut -f1) ($(stat -c %s "$f") bytes)"
+            echo
+            echo '```'
+            cat "$f.sha256"
+            echo
+            cat dist/shears-cli-linux-x86_64-cuda/BUILD_INFO.txt
+            echo
+            echo "NEEDED entries:"
+            cat dist/needed.txt
+            echo
+            echo "ldd (bundle, libcuda.so.1 via the toolkit stub):"
+            cat dist/ldd.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64-cuda
+          path: |
+            dist/shears-cli-linux-x86_64-cuda.tar.gz
+            dist/shears-cli-linux-x86_64-cuda.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  # Publishing: pushes to cuda-binary and main only, after the build. A PRE-RELEASE, replaced on every run.
+  publish:
+    name: Publish the experimental CUDA tarball (pre-release)
+    if: ${{ github.event_name == 'push' }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: linux-x86_64-cuda-experimental
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64-cuda
+          path: artifact
+
+      - name: Publish release assets
+        run: |
+          notes="EXPERIMENTAL and UNTESTED. shears-cli for Linux x86_64 with the MLX CUDA backend, built from commit $GITHUB_SHA against CUDA 13.0 (Colab's GPU image). It was compiled on a machine with no GPU and has never been run on one. The NVIDIA libraries are not included: it needs libcuda.so.1 (the driver), libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libnvrtc.so.13 and libcudnn.so.9 on the library path, glibc 2.39 or newer, and g++. Device code for compute capability 7.5, 8.0 and 9.0. Used by Notebooks/Shears.ipynb on a Colab GPU runtime; the CPU build is the release linux-x86_64-latest. See docs/linux.md. Replaced on every push."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease --notes "$notes"
+          else
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "shears-cli for Linux x86_64, CUDA (experimental, untested)" --notes "$notes"
+          fi
+          gh release upload "$TAG" artifact/shears-cli-linux-x86_64-cuda.tar.gz artifact/shears-cli-linux-x86_64-cuda.tar.gz.sha256 --clobber
