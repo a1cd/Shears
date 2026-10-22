@@ -263,11 +263,16 @@ public enum MergeAndSliceExport {
                 "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
                 "generation_config.json", "special_tokens_map.json",
             ] {
+                // `fileExists` follows links, so a dangling source link is skipped. The bytes are
+                // read through the link and written as a regular file: `copyItem` would copy a
+                // Hugging Face cache snapshot's relative `../../blobs/...` link itself, which
+                // dangles in the export directory.
                 let from = src.appendingPathComponent(f)
                 let to = directory.appendingPathComponent(f)
                 if fm.fileExists(atPath: from.path) {
+                    let bytes = try Data(contentsOf: from.resolvingSymlinksInPath())
                     try? fm.removeItem(at: to)
-                    try fm.copyItem(at: from, to: to)
+                    try bytes.write(to: to)
                 }
             }
         }
