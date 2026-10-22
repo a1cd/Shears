@@ -22,7 +22,10 @@ public enum MergeAndSliceExport {
     public struct Options {
         public var dtype: DType = .bfloat16
         public var layersPerShard = 5
-        public var prefix = "model.language_model."
+        /// The tensor name prefix. `nil` follows the config that is written: `model.language_model.` when the
+        /// source `config.json` is multimodal (has a `text_config`, as `google/gemma-4-26B-A4B-it` does), and
+        /// `model.` for a text-only config, which is what transformers' `Gemma4ForCausalLM` expects.
+        public var prefix: String?
         /// A directory whose `config.json` and tokenizer files are carried over.
         public var sourceDirectory: URL?
         public init() {}
@@ -139,7 +142,7 @@ public enum MergeAndSliceExport {
             throw HealingError.invalid(
                 "the model was healed against weights exported as \(qat.exportDType) but this export writes \(options.dtype)")
         }
-        let p = options.prefix
+        let p = options.prefix ?? layoutPrefix(options.sourceDirectory)
         var weightMap: [String: String] = [:]
         var bytes = 0
         func flush(_ name: String, _ tensors: [String: MLXArray]) throws {
@@ -214,6 +217,16 @@ public enum MergeAndSliceExport {
             options: options)
     }
 
+    /// `model.language_model.` for a multimodal source config, `model.` for a text-only or absent one.
+    static func layoutPrefix(_ sourceDirectory: URL?) -> String {
+        guard let src = sourceDirectory,
+            let data = try? Data(contentsOf: src.appendingPathComponent("config.json")),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            json["text_config"] != nil
+        else { return "model." }
+        return "model.language_model."
+    }
+
     private static func writeConfiguration(
         _ c: Gemma4Configuration, kept: Int, to directory: URL, options: Options
     ) throws {
@@ -244,8 +257,7 @@ public enum MergeAndSliceExport {
             let data = try JSONEncoder().encode(cfg)
             root = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         }
-        try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys, .prettyPrinted])
-            .write(to: directory.appendingPathComponent("config.json"))
+        try Data(ConfigJSON.text(root).utf8).write(to: directory.appendingPathComponent("config.json"))
         if let src = options.sourceDirectory {
             for f in [
                 "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
@@ -259,5 +271,60 @@ public enum MergeAndSliceExport {
                 }
             }
         }
+    }
+}
+
+/// Writes `config.json` with floats kept as floats. `JSONSerialization` writes `30.0` as `30`, and
+/// Hugging Face transformers validates `final_logit_softcapping` (and the other float settings) as a
+/// float, so a config with `30` fails to load. The settings in `floatKeys` are always written with a
+/// decimal point, even when they arrive as integers (the `Codable` path encodes `30.0` as `30`).
+enum ConfigJSON {
+    static let floatKeys: Set<String> = [
+        "final_logit_softcapping", "attn_logit_softcapping", "rms_norm_eps", "rope_theta",
+        "partial_rotary_factor", "factor", "initializer_range",
+    ]
+
+    static func text(_ root: [String: Any]) -> String {
+        render(root, key: nil, indent: 0) + "\n"
+    }
+
+    private static func fragment(_ value: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]) else {
+            return "null"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func render(_ value: Any, key: String?, indent: Int) -> String {
+        let pad = String(repeating: " ", count: indent)
+        let inner = String(repeating: " ", count: indent + 2)
+        switch value {
+        case let d as [String: Any]:
+            if d.isEmpty { return "{}" }
+            let items = d.keys.sorted().map { k in
+                "\(inner)\(fragment(k)): \(render(d[k]!, key: k, indent: indent + 2))"
+            }
+            return "{\n" + items.joined(separator: ",\n") + "\n\(pad)}"
+        case let a as [Any]:
+            if a.isEmpty { return "[]" }
+            let items = a.map { inner + render($0, key: key, indent: indent + 2) }
+            return "[\n" + items.joined(separator: ",\n") + "\n\(pad)]"
+        case let n as NSNumber:
+            if n.isBoolean { return n.boolValue ? "true" : "false" }
+            if n.isFloatingPoint || (key.map(floatKeys.contains) ?? false) { return float(n.doubleValue) }
+            return n.stringValue
+        case is NSNull:
+            return "null"
+        default:
+            return fragment(value)
+        }
+    }
+
+    /// The shortest text that reads back as the same value, always with a decimal point or exponent.
+    private static func float(_ d: Double) -> String {
+        guard d.isFinite else { return "null" }
+        let f = Float(d)
+        let text = Double(f) == d ? f.description : d.description  // 1e-06, not 9.999999974752427e-07
+        return text
     }
 }

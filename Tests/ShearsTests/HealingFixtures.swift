@@ -14,28 +14,7 @@ enum HealingFixture {
     static let experts = 8
     static let topK = 2
 
-    static func configJSON(layers: Int = 4) -> [String: Any] {
-        let types = (0 ..< layers).map { ($0 % 2 == 1 || $0 == layers - 1) ? "full_attention" : "sliding_attention" }
-        return [
-            "model_type": "gemma4_text",
-            "hidden_size": 64, "num_hidden_layers": layers, "intermediate_size": 96,
-            "num_attention_heads": 4, "head_dim": 16, "global_head_dim": 32,
-            "num_key_value_heads": 2, "num_global_key_value_heads": 1,
-            "attention_k_eq_v": true, "rms_norm_eps": 1e-6, "vocab_size": vocab,
-            "num_kv_shared_layers": 0, "hidden_size_per_layer_input": 0,
-            "use_double_wide_mlp": false, "sliding_window": 8,
-            "final_logit_softcapping": 30.0, "enable_moe_block": true,
-            "num_experts": experts, "top_k_experts": topK, "moe_intermediate_size": 32,
-            "max_position_embeddings": 512,
-            "layer_types": types, "tie_word_embeddings": true,
-            "rope_parameters": [
-                "sliding_attention": ["rope_theta": 10000.0, "rope_type": "default"],
-                "full_attention": [
-                    "rope_theta": 1_000_000.0, "partial_rotary_factor": 0.25, "rope_type": "proportional",
-                ],
-            ],
-        ]
-    }
+    static func configJSON(layers: Int = 4) -> [String: Any] { SampleWorkspace.configJSON(layers: layers) }
 
     static func config(layers: Int = 4) throws -> Gemma4Configuration {
         let data = try JSONSerialization.data(withJSONObject: configJSON(layers: layers))

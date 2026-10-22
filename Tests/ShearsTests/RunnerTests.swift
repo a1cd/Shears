@@ -78,6 +78,57 @@ final class RunnerTests: ShearsTestCase {
         try FileManager.default.copyItem(at: dir, to: dest)
     }
 
+    /// `shears-cli sample` writes what `Examples/tiny-config.json` names, and the config runs on it.
+    func testSampleCommandWritesAWorkspaceTheSampleConfigRuns() throws {
+        let dir = try tempDir("sample")
+        XCTAssertEqual(ShearsRunner.main(arguments: ["shears-cli", "sample", dir.path], installSignalHandlers: false), 0)
+        try FileManager.default.copyItem(at: Self.sampleConfig, to: dir.appendingPathComponent("config.json"))
+        // A Hugging Face layout directory with the tokenizer files a Python loader needs.
+        for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("model/\(f)").path), f)
+        }
+        XCTAssertEqual(ShearsRunner.main(arguments: ["shears-cli", "sample"], installSignalHandlers: false), 2)
+        let cfg = try config(dir)
+        var env = RunEnvironment()
+        env.log = { _ in }
+        for command in [ShearsCommand.select, .prepass, .heal, .export] {
+            XCTAssertEqual(try ShearsRunner.execute(command, config: cfg, environment: env), .finished, "\(command)")
+        }
+        let exported = try Gemma4Checkpoint(directory: dir.appendingPathComponent("out/export"))
+        XCTAssertEqual(exported.configuration.numExperts, 4)
+    }
+
+    /// transformers validates `final_logit_softcapping` and the other float settings as floats, so an
+    /// export must write `30.0`, not `30` (which is what `JSONSerialization` writes by itself).
+    func testExportedConfigKeepsFloatsAsFloats() throws {
+        let dir = try tempDir("floats")
+        try SampleWorkspace.write(to: dir)
+        let cfg = try RunnerConfig.load(from: {
+            try FileManager.default.copyItem(at: Self.sampleConfig, to: dir.appendingPathComponent("config.json"))
+            return dir.appendingPathComponent("config.json")
+        }())
+        var env = RunEnvironment()
+        env.log = { _ in }
+        // The sample model's config came from the Codable form; the export reads it back and writes it again ...
+        for command in [ShearsCommand.select, .prepass, .heal, .export] {
+            XCTAssertEqual(try ShearsRunner.execute(command, config: cfg, environment: env), .finished, "\(command)")
+        }
+        let text = try String(contentsOf: dir.appendingPathComponent("out/export/config.json"), encoding: .utf8)
+        XCTAssertTrue(text.contains("\"final_logit_softcapping\": 30.0"), text)
+        XCTAssertTrue(text.contains("\"rope_theta\": 1000000.0"), text)
+        XCTAssertTrue(text.contains("\"rms_norm_eps\": 1e-06"), text)
+        XCTAssertTrue(text.contains("\"num_experts\": 4"), text)
+        XCTAssertTrue(text.contains("\"tie_word_embeddings\": true"), text)
+        // ... and from a source config.json written by Python (30.0 parsed, then written back).
+        let source = try tempDir("floats-source")
+        try #"{"model_type": "gemma4", "text_config": {"final_logit_softcapping": 30.0, "num_experts": 8}}"#
+            .write(to: source.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        let rewritten = ConfigJSON.text(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: source.appendingPathComponent("config.json"))) as! [String: Any])
+        XCTAssertTrue(rewritten.contains("\"final_logit_softcapping\": 30.0"), rewritten)
+        XCTAssertTrue(rewritten.contains("\"num_experts\": 8"), rewritten)
+    }
+
     func testSampleConfigRunsEveryCommandEndToEnd() throws {
         let dir = try workspace()
         let cfg = try config(dir)

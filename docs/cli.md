@@ -35,6 +35,7 @@ cd CLI && xcodebuild build -scheme shears-cli -destination 'platform=macOS'
 shears-cli heal --config path/to/config.json            # also: select, prepass, export, gguf; --stage NAME
 shears-cli run --config path/to/config.json                       # the block-sequential pipeline (below)
 shears-cli sweep --config path/to/config.json                     # learning-rate / variant grid on block 0
+shears-cli sample DIR                                             # a tiny random Gemma 4 MoE (DIR/model) plus DIR/rows.jsonl; copy Examples/tiny-config.json to DIR/config.json and run the commands on it
 shears-cli run --config path/to/config.json --memory-budget 8GB   # a ceiling: refused up front, with the amount, if the run needs more
 ```
 There is no resident-layers option: training always holds as many layers as fit under the run's own memory floor (see [Auto residency](#auto-residency)).

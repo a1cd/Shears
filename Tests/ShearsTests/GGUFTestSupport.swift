@@ -50,7 +50,7 @@ struct GGUFTinyGemma4 {
     var mutate: (inout [String: MLXArray]) -> Void = { _ in }
 
     /// The tokenizer's vocabulary size (specials, a few letters, 256 byte tokens, 3 added).
-    static let vocabCount = 5 + 1 + 26 + 2 + 256 + 3
+    static let vocabCount = SampleWorkspace.tokenizerVocabCount
 
     var layers: Int { layerTypes.count }
 
@@ -184,49 +184,10 @@ struct GGUFTinyGemma4 {
         return all
     }
 
-    /// A byte-fallback BPE tokenizer in the layout of the real one: special tokens that are
-    /// also listed as added tokens at low ids, a base vocabulary, and added tokens above it.
-    static func writeTokenizer(to dir: URL) throws {
-        var vocab: [String: Int] = [:]
-        let specials = ["<pad>", "<eos>", "<bos>", "<unk>", "<mask>"]
-        for (i, s) in specials.enumerated() { vocab[s] = i }
-        vocab["▁"] = 5
-        for (i, c) in "abcdefghijklmnopqrstuvwxyz".enumerated() { vocab[String(c)] = 6 + i }
-        vocab["▁a"] = 32
-        vocab["ab"] = 33
-        for b in 0 ..< 256 { vocab[String(format: "<0x%02X>", b)] = 34 + b }
-        let added = ["<|turn>", "<turn|>", "<|channel>"]
-        func entry(_ id: Int, _ content: String) -> [String: Any] {
-            [
-                "id": id, "content": content, "single_word": false, "lstrip": false, "rstrip": false,
-                "normalized": false, "special": true,
-            ]
-        }
-        var addedTokens = specials.enumerated().map { entry($0.offset, $0.element) }
-        for (i, s) in added.enumerated() { addedTokens.append(entry(290 + i, s)) }
-        let tokenizerJSON: [String: Any] = [
-            "version": "1.0", "added_tokens": addedTokens,
-            "normalizer": ["type": "Replace", "pattern": ["String": " "], "content": "▁"],
-            "model": [
-                "type": "BPE", "vocab": vocab, "merges": [["▁", "a"], ["a", "b"]],
-                "byte_fallback": true,
-            ],
-        ]
-        try JSONSerialization.data(withJSONObject: tokenizerJSON).write(
-            to: dir.appendingPathComponent("tokenizer.json"))
-        let tokenizerConfig: [String: Any] = [
-            "bos_token": "<bos>", "eos_token": "<eos>", "unk_token": "<unk>", "pad_token": "<pad>",
-            "mask_token": "<mask>", "eot_token": "<turn|>", "soc_token": "<|channel>",
-            "extra_special_tokens": ["<|turn>"], "add_eos_token": false,
-        ]
-        try JSONSerialization.data(withJSONObject: tokenizerConfig).write(
-            to: dir.appendingPathComponent("tokenizer_config.json"))
-        try Self.chatTemplate.write(
-            to: dir.appendingPathComponent("chat_template.jinja"), atomically: true, encoding: .utf8)
-    }
+    /// The sample workspace's tokenizer (`shears-cli sample` writes it too).
+    static func writeTokenizer(to dir: URL) throws { try SampleWorkspace.writeTokenizer(to: dir) }
 
-    static let chatTemplate =
-        "{{ bos_token }}{% for m in messages %}<|turn>{{ m['role'] }}\n{{ m['content'] }}<turn|>\n{% endfor %}"
+    static let chatTemplate = SampleWorkspace.chatTemplate
 }
 
 extension ShearsTestCase {

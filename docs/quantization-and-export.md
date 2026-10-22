@@ -65,3 +65,15 @@ the port reproduces the pattern found by comparing against the reference output 
 **Sampling defaults.** The reference converter copies `generation_config.json` into
 `general.sampling.*` keys (and `suppress_tokens` for the unified Gemma 4 architecture); so does the
 export, with the converter's mapping, key order and precedence (`GGUFGenerationConfig`).
+
+## Loading the export with transformers
+
+`shears-cli export` writes a Hugging Face checkpoint, and `AutoModelForCausalLM.from_pretrained(dir)` loads it (transformers 5.20.2 tested; Gemma 4 first appears in 5.5.0). Four details of the export exist for that reason, each found by trying to load one:
+
+- **Floats stay floats.** `config.json` writes `final_logit_softcapping` as `30.0`, not `30`: transformers validates it as a float and refuses an integer. Foundation's `JSONSerialization` writes `30.0` as `30`, so the exporter writes this file itself (`ConfigJSON`).
+- **Tensor names follow the config.** A source `config.json` with a `text_config` (the multimodal `google/gemma-4-26B-A4B-it`) gives `model.language_model.*` names; a text-only config, such as the one `shears-cli sample` writes, gives `model.*`, which is what `Gemma4ForCausalLM` expects. Before, a text-only config got the multimodal names and loaded with every weight missing.
+- **No default rope `factor`.** It is written only when it is not 1.0, because transformers warns about a `factor` on the `proportional` rope type.
+- **Vision and audio weights are not exported.** For a multimodal source config, transformers builds the vision tower without weights; the text model is what Shears healed. (Not tried on the real 26B.)
+
+Checked on the tiny sample model: in float32, transformers' top-5 next-token log-probabilities for a prompt equal `shears-serve`'s on the same export to four decimals (the top token and its probability, -1.6193). In bf16 they differ in the second decimal, which is bf16 rounding on a random model.
+

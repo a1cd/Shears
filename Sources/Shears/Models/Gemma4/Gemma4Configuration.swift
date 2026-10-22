@@ -206,16 +206,18 @@ public struct Gemma4Configuration: Codable, Sendable {
         try c.encodeIfPresent(moeIntermediateSize, forKey: .moeIntermediateSize)
         try c.encode(layerTypes, forKey: .layerTypes)
         try c.encode(tieWordEmbeddings, forKey: .tieWordEmbeddings)
+        var full: [String: RopeValue] = [
+            "rope_theta": .number(fullRopeTheta),
+            "partial_rotary_factor": .number(fullPartialRotaryFactor),
+            "rope_type": .string(fullRopeType),
+        ]
+        // transformers warns about a `factor` on the proportional rope type, so write it only when it isn't the default.
+        if fullRopeFactor != 1.0 { full["factor"] = .number(fullRopeFactor) }
         let rope: [String: [String: RopeValue]] = [
             "sliding_attention": [
                 "rope_theta": .number(slidingRopeTheta), "rope_type": .string(slidingRopeType),
             ],
-            "full_attention": [
-                "rope_theta": .number(fullRopeTheta),
-                "partial_rotary_factor": .number(fullPartialRotaryFactor),
-                "factor": .number(fullRopeFactor),
-                "rope_type": .string(fullRopeType),
-            ],
+            "full_attention": full,
         ]
         try c.encode(rope, forKey: .ropeParameters)
     }

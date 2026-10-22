@@ -41,6 +41,8 @@ public enum ShearsRunner {
           heal      run the config's stages in order (or just --stage <name>)
           export    merge the adapters and slice to the kept experts (Hugging Face layout)
           gguf      convert the exported directory to a GGUF file
+          sample    shears-cli sample <dir>: write a tiny random Gemma 4 MoE (model/) and rows.jsonl into <dir>, to try
+                    the commands on with Examples/tiny-config.json (copy it to <dir>/config.json). Needs no --config
 
         options of heal:
           --memory-budget <size>    a ceiling on MLX memory, e.g. 3GB or 512MB. It is only checked: the run needs what
@@ -68,6 +70,20 @@ public enum ShearsRunner {
             return 0
         }
         args.removeFirst()
+        if name == "sample" {
+            guard args.count == 1, !args[0].hasPrefix("-") else {
+                FileHandle.standardError.write(Data("usage: shears-cli sample <dir>\n".utf8))
+                return 2
+            }
+            do {
+                try SampleWorkspace.write(to: URL(fileURLWithPath: args[0]))
+                print("wrote \(args[0])/model and \(args[0])/rows.jsonl")
+                return 0
+            } catch {
+                FileHandle.standardError.write(Data("shears-cli: \(error)\n".utf8))
+                return 1
+            }
+        }
         do {
             guard let command = ShearsCommand(rawValue: name) else {
                 throw RunnerError.usage("unknown command '\(name)'\n\(usage)")
