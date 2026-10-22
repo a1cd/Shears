@@ -53,6 +53,12 @@ extension Run {
         o.storageDType = try parseDType(p?.storageDType)
         if let x = p?.maxBatchTokens { o.maxBatchTokens = x }
         if let x = p?.maxBatchRows { o.maxBatchRows = x }
+        if let t = p?.teacherPass {
+            guard let pass = TeacherPass(rawValue: t) else { throw RunnerError.config("pipeline.teacherPass '\(t)': block or batch") }
+            o.teacherPass = pass
+        }
+        if let x = p?.teacherStateBudgetGB { o.teacherStateBudgetBytes = Int(x * gibibyte) }
+        if let x = p?.padWalks { o.padWalks = x }
         o.maxBlocks = p?.maxBlocks
         o.tokenChunk = c.memory?.tokenChunk
         if let r = c.memory?.mergedMaxKeptRatio { ExpertCompute.mergedMaxKeptRatio = r }

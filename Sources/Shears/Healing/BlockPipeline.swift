@@ -17,6 +17,12 @@ public enum InputMix: String, Sendable, Codable {
     case both
 }
 
+/// When the teacher's block ends are computed (see ``BlockPipelineOptions/teacherPass``).
+public enum TeacherPass: String, Sendable, Codable {
+    case perBlock = "block"
+    case perBatch = "batch"
+}
+
 /// Rows that begin with the same tokens (a common prompt) share their prefix's work.
 public enum SharedPrefixMode: Sendable, Equatable {
     case off
@@ -36,6 +42,21 @@ public struct BlockPipelineOptions {
     /// Padded-token and row limits of the batches the walks run in.
     public var maxBatchTokens = 8192
     public var maxBatchRows = 16
+    /// When the teacher's block ends are computed for the training rows. ``TeacherPass/perBlock`` (default): for every
+    /// row of the block in one go before its training starts, so the teacher's layers (all 128 experts of each) are
+    /// read once per block. ``TeacherPass/perBatch``: for each rolling batch just before its steps, which reads the
+    /// whole block again for every batch.
+    public var teacherPass = TeacherPass.perBlock
+    /// With ``TeacherPass/perBlock``, the most bytes of hidden states one walk of the block's layers holds (rows x tokens
+    /// x hidden, at the compute dtype's width, not counting the layer being walked). Rows beyond it wait for a second
+    /// walk, so a block reads its teacher layers `ceil(states / budget)` times at most.
+    public var teacherStateBudgetBytes = 2 << 30
+    /// Pad the teacher walk's and the next frontier's batches up to a small set of shapes: the length to the next of
+    /// ``StreamedBlockHealer/sequenceBuckets`` and the row count to the next power of two (when that stays within
+    /// ``maxBatchTokens``), with zero rows. Attention is causal and every row is cut back to its own length afterwards,
+    /// so no value changes (to float rounding; tested), but a backend that compiles a kernel per shape (MLX's CUDA
+    /// JIT) meets a handful of shapes instead of a new one in every batch.
+    public var padWalks = true
     /// A ceiling on MLX memory. By default the whole block is resident; with a budget the window is the largest whose
     /// estimate fits it (see ``ResidencyPlanner/chooseAuto(_:otherStagesPeak:ceiling:)``), and a run whose floor is
     /// above the budget is refused with the amount it needs.
@@ -271,15 +292,26 @@ public final class BlockPipeline {
     }
     func has(_ kind: String, _ row: String, _ boundary: Int) -> Bool { store.has(row: Self.key(kind, row), boundary: boundary) }
 
-    /// Padded `[B, T, D]` batch of states (right-padded with zeros) and each row's length.
-    func stack(_ states: [MLXArray], compute: DType?) -> MLXArray {
-        let longest = states.map { $0.dim(1) }.max() ?? 0
-        return concatenated(states.map { x in
+    /// Padded `[B, T, D]` batch of states (right-padded with zeros) and each row's length. With `bucketed` (and
+    /// ``BlockPipelineOptions/padWalks``) the length is rounded up to its bucket and the rows to a power of two.
+    func stack(_ states: [MLXArray], compute: DType?, bucketed: Bool = false) -> MLXArray {
+        let bucket = bucketed && options.padWalks
+        var longest = states.map { $0.dim(1) }.max() ?? 0
+        if bucket { longest = StreamedBlockHealer.sequenceBucket(for: longest) }
+        var out = concatenated(states.map { x in
             var x = x
             if let compute, x.dtype != compute { x = x.asType(compute) }
             let pad = longest - x.dim(1)
             return pad == 0 ? x : concatenated([x, MLXArray.zeros([1, pad, x.dim(2)], dtype: x.dtype)], axis: 1)
         }, axis: 0)
+        if bucket {
+            var rows = 1
+            while rows < states.count { rows *= 2 }
+            if rows > states.count, rows * longest <= options.maxBatchTokens {
+                out = concatenated([out, MLXArray.zeros([rows - states.count, out.dim(1), out.dim(2)], dtype: out.dtype)], axis: 0)
+            }
+        }
+        return out
     }
 
     // MARK: run
@@ -337,6 +369,7 @@ public final class BlockPipeline {
         var fp = Fingerprint()
         for r in used { fp.add(r.key); fp.add(TeacherPrepass.fingerprint(r)) }
         let probe = try source.loadLayers(0 ... 0, keeping: nil)
+        hiddenSize = probe.first?.hiddenSize ?? 1
         storage = options.storageDType ?? TeacherPrepass.computeDType(probe) ?? .bfloat16
         let teacher = try source.teacherFingerprint()
         var fresh = Manifest(
@@ -431,10 +464,18 @@ public final class BlockPipeline {
             // 1. prepare the first batch (with selection), measuring its peak
             let needSelection = options.fixedKeep == nil && !st.selectionDone
             let batch0 = unique(batchRows(rows, 0, steps: steps).map(\.row) + options.evalRows)
-            if !st.prepared.contains(0) || needSelection {
+            // Per block (default): every batch's rows go through the teacher in this one stage, so the block's teacher
+            // layers are read once (per walk of the state budget), not once per rolling batch.
+            let wholeBlock = options.teacherPass == .perBlock
+            let needAll = wholeBlock && !st.trainingDone && (0 ..< batchCount).contains { !st.prepared.contains($0) }
+            if !st.prepared.contains(0) || needSelection || needAll {
                 Memory.peakMemory = Memory.activeMemory
+                let label = wholeBlock
+                    ? "block \(b + 1)/\(blocks.count), all \(batchCount) batch\(batchCount == 1 ? "" : "es")"
+                    : "block \(b + 1)/\(blocks.count), batch 1/\(batchCount)"
                 try prepare(
-                    block: b, rows: batch0, selecting: needSelection, state: &st, keep: &keep, prefix: sharedP,
+                    block: b, rows: wholeBlock ? sequences : batch0, selecting: needSelection, selectionRows: batch0, state: &st,
+                    keep: &keep, prefix: sharedP, label: label, log: log,
                     persist: { s in
                         self.manifest.blocks["\(b)"] = s
                         try? self.saveManifest()
@@ -443,7 +484,7 @@ public final class BlockPipeline {
                         }
                     })
                 if needSelection { st.selectionDone = true }
-                if !st.prepared.contains(0) { st.prepared.append(0) }
+                for k in 0 ..< batchCount where (k == 0 || wholeBlock) && !st.prepared.contains(k) { st.prepared.append(k) }
                 manifest.otherStagesPeak = max(manifest.otherStagesPeak, Memory.peakMemory)
                 try commit()
             }
@@ -452,7 +493,8 @@ public final class BlockPipeline {
                 for k in 1 ..< batchCount where !st.prepared.contains(k) {
                     try prepare(
                         block: b, rows: unique(batchRows(rows, k, steps: steps).map(\.row)), selecting: false, state: &st,
-                        keep: &keep, prefix: sharedP, persist: { _ in })
+                        keep: &keep, prefix: sharedP, label: "block \(b + 1)/\(blocks.count), batch \(k + 1)/\(batchCount)", log: log,
+                        persist: { _ in })
                     st.prepared.append(k)
                 }
                 try commit()
@@ -563,7 +605,8 @@ public final class BlockPipeline {
                         Memory.peakMemory = Memory.activeMemory
                         try prepare(
                             block: b, rows: unique(batchRows(rows, k, steps: steps).map(\.row)), selecting: false, state: &st,
-                            keep: &keep, prefix: sharedP, persist: { _ in })
+                            keep: &keep, prefix: sharedP, label: "block \(b + 1)/\(blocks.count), batch \(k + 1)/\(batchCount)", log: log,
+                            persist: { _ in })
                         manifest.otherStagesPeak = max(manifest.otherStagesPeak, Memory.peakMemory)
                         Memory.peakMemory = max(before, Memory.activeMemory)
                         st.prepared.append(k)
@@ -720,7 +763,9 @@ public final class BlockPipeline {
                 try? fm.removeItem(at: ckpt)
             }
             let finished = adapters.tensors()
-            adaptersAll.merge(finished) { $1 }
+            // The report's adapters are read back from the block's file (lazily, as `loadArrays` does), so a finished
+            // block's adapters are not held in memory through the rest of the run; they are read when the caller saves them.
+            adaptersAll.merge(fm.fileExists(atPath: blockFile.path) ? try loadArrays(url: blockFile) : finished) { $1 }
             infos.append(BlockInfo(
                 block: b, residentLayers: resident, decision: st.decision, losses: losses, skippedUpdates: skips,
                 trainingPeakBytes: trainingPeak, secondsPerStep: seconds.isEmpty ? 0 : seconds.dropFirst().reduce(0, +) / Double(max(1, seconds.count - 1)),
@@ -773,26 +818,104 @@ public final class BlockPipeline {
 
     // MARK: prepare: the teacher pass (and selection)
 
+    /// Where a teacher walk's time went: loading the layers (and the bytes of weights that is), the first evaluation
+    /// of each kernel shape this process has not run before (which on a GPU includes its JIT compile), and the
+    /// rest of the evaluations.
+    struct TeacherTiming {
+        var passes = 0
+        var rows = 0
+        var layerLoads = 0
+        var loadSeconds = 0.0
+        var loadBytes = 0
+        var firstCallSeconds = 0.0
+        var firstCalls = 0
+        var computeSeconds = 0.0
+        var selectionSeconds = 0.0
+        var fileBackedGrowth = 0
+        var wallSeconds = 0.0
+
+        static func gb(_ b: Int) -> String { String(format: "%.2f GB", Double(b) / 1_073_741_824) }
+        func line(_ label: String) -> String {
+            var s = String(format: "%@: teacher outputs %.1f s = read %.1f s (%@)", label, wallSeconds, loadSeconds, Self.gb(loadBytes))
+            s += String(format: " + first-call/compile %.1f s (%d new kernel shapes) + compute %.1f s", firstCallSeconds, firstCalls, computeSeconds)
+            if selectionSeconds > 0 { s += String(format: " + selection %.1f s", selectionSeconds) }
+            s += "; \(rows) rows in \(passes) walk\(passes == 1 ? "" : "s"), \(layerLoads) layer loads"
+            if fileBackedGrowth > 0 { s += ", file-backed pages +\(Self.gb(fileBackedGrowth)) (pages of mapped weights are read on first use, inside the compute figure)" }
+            return s
+        }
+    }
+
+    /// Kernel shapes (rows x tokens x hidden, dtype, attention shape) a teacher walk has evaluated in this process: the
+    /// first evaluation of one is timed apart as first-call/compile time.
+    var seenWalkShapes = Set<String>()
+    /// The model's hidden size, read once from the probe layer at the start of a run.
+    var hiddenSize = 1
+
     /// Walks `rows` through block `b`'s teacher layers one layer at a time with every activation in RAM,
     /// and writes the teacher's block ends. With `selecting`, each layer's experts are chosen in the same
-    /// pass from the rows that have a selection item (their pruned stream advances with the chosen set).
+    /// pass from the rows in `selectionRows` (default: those of `rows` that have a selection item); their pruned
+    /// stream advances with the chosen set.
+    ///
+    /// The other rows are walked in groups whose hidden states fit ``BlockPipelineOptions/teacherStateBudgetBytes``;
+    /// each group is one walk, which loads every layer of the block once. Selection happens in the first.
     func prepare(
-        block b: Int, rows: [HealingRow], selecting: Bool, state st: inout BlockState, keep: inout [[Int]], prefix: Int = 0,
+        block b: Int, rows: [HealingRow], selecting: Bool, selectionRows: [HealingRow]? = nil, state st: inout BlockState,
+        keep: inout [[Int]], prefix: Int = 0, label: String = "", log: ((String) -> Void)? = nil,
         persist: (BlockState) -> Void
     ) throws {
         let range = blockRanges(ends: blockEnds)[b]
-        let selRows = selecting ? rows.filter { options.items[$0.key] != nil } : []
+        let candidates = selectionRows ?? rows
+        let selRows = selecting ? candidates.filter { options.items[$0.key] != nil } : []
         if selecting && selRows.isEmpty {
             throw HealingError.invalid("block \(b + 1): none of its first batch's rows has a selection item")
         }
         let selKeys = Set(selRows.map(\.key))
         let plain = rows.filter { !selKeys.contains($0.key) && !has("c", $0.key, b + 1) }
         if plain.isEmpty && selRows.isEmpty { return }
-        // Rows whose targets are already written need no walk (a resumed batch), except selection rows.
+        // Groups of rows of similar length, then walks of as many groups as fit the state budget. A walk costs one
+        // read of every layer of the block, so the fewer walks the better; the budget only bounds the hidden states.
         let groups = TeacherPrepass.batches(lengths: plain.map(\.length), maxTokens: options.maxBatchTokens, maxRows: options.maxBatchRows)
+        let perToken = max(1, hiddenSize * 4)  // the compute dtype's widest; storage may be narrower
+        var walks: [[[Int]]] = []
+        var current: [[Int]] = []
+        var currentBytes = selRows.reduce(0) { $0 + 2 * $1.length * perToken }
+        for g in groups {
+            let longest = g.map { plain[$0].length }.max() ?? 0
+            let bytes = g.count * longest * perToken
+            if !current.isEmpty && currentBytes + bytes > options.teacherStateBudgetBytes {
+                walks.append(current)
+                current = []
+                currentBytes = 0
+            }
+            current.append(g)
+            currentBytes += bytes
+        }
+        if !current.isEmpty || walks.isEmpty { walks.append(current) }
+        var timing = TeacherTiming()
+        let started = Date()
+        let fileBackedBefore = ProcessMemory.snapshot().fileBacked
+        for (n, walk) in walks.enumerated() {
+            try prepareWalk(
+                block: b, plain: plain, groups: walk, selRows: n == 0 ? selRows : [], selecting: selecting && n == 0,
+                state: &st, keep: &keep, prefix: prefix, timing: &timing, persist: persist)
+            timing.passes += 1
+        }
+        timing.rows = plain.count + selRows.count
+        timing.wallSeconds = Date().timeIntervalSince(started)
+        timing.fileBackedGrowth = max(0, ProcessMemory.snapshot().fileBacked - fileBackedBefore)
+        log?(timing.line(label))
+    }
+
+    /// One walk of block `b`'s teacher layers over `groups` of the `plain` rows (and the selection rows).
+    private func prepareWalk(
+        block b: Int, plain: [HealingRow], groups: [[Int]], selRows: [HealingRow], selecting: Bool,
+        state st: inout BlockState, keep: inout [[Int]], prefix: Int, timing: inout TeacherTiming,
+        persist: (BlockState) -> Void
+    ) throws {
+        let range = blockRanges(ends: blockEnds)[b]
         var compute: DType?
         var h: [MLXArray] = try groups.map { g in
-            stack(try g.map { try get("c", plain[$0].key, b) }, compute: nil)
+            stack(try g.map { try get("c", plain[$0].key, b) }, compute: nil, bucketed: true)
         }
         var pre: [MLXArray] = [], suf: [MLXArray] = []
         var hf: [MLXArray] = try selRows.map { try get("c", $0.key, b) }
@@ -800,12 +923,31 @@ public final class BlockPipeline {
         let items = selRows.map { options.items[$0.key]! }
         let selector = options.selection.map { ExpertSelector(configuration: $0) }
         var existing = Dictionary(uniqueKeysWithValues: st.selections.map { ($0.layer, $0) })
+        // Runs `body` (which evaluates) and files its time under first-call/compile when this kernel shape is new
+        // to the process, else under compute.
+        func timed(_ shape: String, _ body: () -> Void) {
+            let t0 = Date()
+            body()
+            let dt = Date().timeIntervalSince(t0)
+            if seenWalkShapes.insert(shape).inserted {
+                timing.firstCallSeconds += dt
+                timing.firstCalls += 1
+            } else {
+                timing.computeSeconds += dt
+            }
+        }
         for l in range.start ... range.end {
+            let t0 = Date()
             let layer = try source.loadLayers(l ... l, keeping: nil)[0]
+            timing.loadSeconds += Date().timeIntervalSince(t0)
+            timing.layerLoads += 1
+            if let m = layer as? Module { timing.loadBytes += m.parameters().flattened().reduce(0) { $0 + $1.1.nbytes } }
             guard layer.numExperts == source.numExperts else {
                 throw HealingError.invalid("the teacher source's layers no longer have all \(source.numExperts) experts")
             }
             if compute == nil { compute = TeacherPrepass.computeDType([layer]) }
+            var kind = "layer"
+            if let m = layer as? Gemma4MoEDecoderLayer { kind = "\(m.selfAttn.numHeads)x\(m.selfAttn.headDim)" }
             if prefix > 0 {
                 BlockPipeline.sharedPrefixWalkCount += 1
                 for g in h.indices {
@@ -814,17 +956,24 @@ public final class BlockPipeline {
                         suf.append(h[g][0..., prefix...])
                     }
                     let x = compute.map { pre[g].dtype == $0 ? (pre[g], suf[g]) : (pre[g].asType($0), suf[g].asType($0)) } ?? (pre[g], suf[g])
-                    (pre[g], suf[g]) = healingLayerForwardShared(layer, prefix: x.0, suffix: x.1, set: nil, adapters: nil)
-                    eval(pre[g], suf[g])
+                    timed("shared \(x.0.shape) \(x.1.shape) \(x.1.dtype) \(kind)") {
+                        (pre[g], suf[g]) = healingLayerForwardShared(layer, prefix: x.0, suffix: x.1, set: nil, adapters: nil)
+                        eval(pre[g], suf[g])
+                    }
                 }
             } else {
                 for i in h.indices {
-                    h[i] = healingLayerForward(layer, compute.map { h[i].dtype == $0 ? h[i] : h[i].asType($0) } ?? h[i], set: nil, adapters: nil)
-                    eval(h[i])
+                    let x = compute.map { h[i].dtype == $0 ? h[i] : h[i].asType($0) } ?? h[i]
+                    timed("\(x.shape) \(x.dtype) \(kind)") {
+                        h[i] = healingLayerForward(layer, x, set: nil, adapters: nil)
+                        eval(h[i])
+                    }
                 }
             }
             if selecting, let selector {
+                let s0 = Date()
                 let rec = selector.step(layer: layer, index: l, items: items, hf: &hf, hp: &hp, existing: existing[l])
+                timing.selectionSeconds += Date().timeIntervalSince(s0)
                 existing[l] = rec
                 keep[l] = rec.chosen
                 st.selections.removeAll { $0.layer == l }
@@ -944,7 +1093,7 @@ public final class BlockPipeline {
             let needClean = batch.filter { !has("c", $0.key, b + 1) }
             var compute: DType?
             // Student walk on the dirty input (block 0's is the clean one).
-            var d = stack(try batch.map { try get(b == 0 ? "c" : "d", $0.key, b) }, compute: nil)
+            var d = stack(try batch.map { try get(b == 0 ? "c" : "d", $0.key, b) }, compute: nil, bucketed: true)
             for l in range.start ... range.end {
                 let i = l - range.start
                 let layer = try source.loadLayers(l ... l, keeping: sliced ? [kept[i]] : nil)[0]
@@ -955,7 +1104,7 @@ public final class BlockPipeline {
             }
             for (j, r) in batch.enumerated() { try put("d", r.key, b + 1, stopGradient(d[j ..< j + 1, 0 ..< r.length])) }
             if !needClean.isEmpty {
-                var t = stack(try needClean.map { try get("c", $0.key, b) }, compute: nil)
+                var t = stack(try needClean.map { try get("c", $0.key, b) }, compute: nil, bucketed: true)
                 for l in range.start ... range.end {
                     let layer = try source.loadLayers(l ... l, keeping: nil)[0]
                     t = healingLayerForward(layer, compute.map { t.dtype == $0 ? t : t.asType($0) } ?? t, set: nil, adapters: nil)

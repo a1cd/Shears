@@ -91,6 +91,9 @@ final class CompiledLayerStep {
     }
 
     private var slots: [String: Slot] = [:]
+    nonisolated(unsafe) static var live = 0
+    init() { Self.live += 1 }
+    deinit { Self.live -= 1 }
     /// Times a body was traced (compiled), across every function.
     private(set) var traces = 0
     /// Compiled calls made.
@@ -303,9 +306,11 @@ final class CompiledLayerStep {
                 let set = ctx.sets[j]
                 let sliced = ctx.sliced
                 if j < ctx.recomputed {
-                    h = checkpoint(la) { (m: LayerAdapters, x: MLXArray) in
-                        healingLayerForward(layer, x, set: set, adapters: m, sliced: sliced)
-                    }(h)
+                    // The closure is kept in the cached graph: it reaches the layer through `ctx` (emptied after
+                    // every call), not by capturing the layer, its adapters or the expert set.
+                    h = checkpointApplied(la, h) { [unowned ctx] (m: LayerAdapters, x: MLXArray) in
+                        healingLayerForward(ctx.layers[j], x, set: ctx.sets[j], adapters: m, sliced: ctx.sliced)
+                    }
                 } else {
                     h = healingLayerForward(layer, h, set: set, adapters: la, sliced: sliced)
                 }
