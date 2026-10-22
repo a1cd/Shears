@@ -13,7 +13,7 @@ fails on the user's machine with 'cannot open source file "cute/tensor.hpp"' (Co
 
 usage: check_jit_headers.py <bundle root> <mlx cuda device dir> <toolkit include dir> <stock cccl dir> <libnvrtc.so.13>
 """
-import ctypes, os, re, sys, tempfile, pathlib
+import ctypes, os, re, sys, tempfile, pathlib, time
 
 bundle, device_dir, toolkit_inc, stock_cccl, nvrtc_path = map(pathlib.Path, sys.argv[1:6])
 
@@ -90,8 +90,9 @@ CASES = [
 empty = pathlib.Path(tempfile.mkdtemp())          # a bundle without any headers: what the first tarball was
 failed = False
 for module, arch, expr in CASES:
+    t0 = time.time()
     ok, log = compile_kernel(module, expr, arch, mlx_include_args(bundle))
-    print(f"[with the bundle's headers] {module} for {arch}: {'compiled' if ok else 'FAILED'}")
+    print(f"[with the bundle's headers] {module} for {arch}: {'compiled' if ok else 'FAILED'} in {time.time() - t0:.1f} s (one NVRTC compile, {os.cpu_count()} CPUs)")
     if not ok:
         print(log[-3000:]); failed = True
     ok2, log2 = compile_kernel(module, expr, arch, mlx_include_args(empty))

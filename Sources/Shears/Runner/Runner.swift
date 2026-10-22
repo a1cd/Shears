@@ -647,8 +647,9 @@ final class Progress {
         let process = r.peakFootprintBytes > 0
             ? "  process peak \(gb(r.peakFootprintBytes)) (file-backed pages resident in the process: \(gb(r.fileBackedBytes)))" : ""
         log(String(
-            format: "[%@ %@] step %d/%d  loss %.5f  lr %.3e  %.2f s/step  mlx peak %@%@%@", stage, label, r.step, total,
-            r.loss, r.learningRate, mean, gb(Memory.peakMemory), process, r.applied ? "" : "  (update skipped)"))
+            format: "[%@ %@] step %d/%d  loss %.5f  lr %.3e  this step %.2f s  (mean of the last %d: %.2f s/step)  mlx peak %@%@%@", stage,
+            label, r.step, total, r.loss, r.learningRate, r.seconds, recent.count, mean, gb(Memory.peakMemory), process,
+            r.applied ? "" : "  (update skipped)"))
     }
 }
 
