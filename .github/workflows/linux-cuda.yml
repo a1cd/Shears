@@ -5,7 +5,7 @@ name: Linux CUDA (experimental)
 # See docs/linux.md. The CPU binary is built by linux.yml and is untouched by this workflow.
 on:
   push:
-    branches: [cuda-binary, main, ci/fast-builds]   # ci/fast-builds: temporary
+    branches: [cuda-binary, main]
     paths:
       - ".github/workflows/linux-cuda.yml"
       - ".github/scripts/package-linux-cuda.sh"
@@ -81,12 +81,23 @@ jobs:
           key: cuda-build-${{ steps.cuda.outputs.salt }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift') }}
           restore-keys: cuda-build-${{ steps.cuda.outputs.salt }}-
 
+      # nvcc --threads 3 compiles the architectures of one file in parallel: 1171 s instead of 2147 s for the 98 .cu files
+      # (measured on this runner, nvcc alone, 3 files at once). It also took the runner down to 357 MB of free RAM, which is
+      # why there is swap: running out of memory then slows the build instead of killing it.
+      - name: Swap file (headroom for nvcc --threads)
+        run: |
+          sudo fallocate -l 12G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
+          free -m
+          # redirected completely, or the step would wait for the background loop's stderr pipe
+          ( while sleep 10; do free -m | awk '/Mem:/{a=$7} /Swap:/{u=$3} END{print a, u}'; done ) > "$RUNNER_TEMP/mem.txt" 2>&1 < /dev/null &
+
       - name: swift build shears-cli (CUDA)
         id: build
         working-directory: CLI
         env:
           SPM_CUDA: "1"
           CUDA_ARCH: sm_75   # read by encuda; the wrapper above replaces it
+          SHEARS_NVCC_THREADS: "3"
         run: |
           export PATH="$HOME/nvcc-wrapper:/usr/local/cuda/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
@@ -122,6 +133,7 @@ jobs:
             echo "release build: ${{ steps.build.outcome }}"
             awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
             ccache -s | grep -E 'Hits|Misses|Cache size'
+            echo "lowest available RAM MB: $(awk '{print $1}' "$RUNNER_TEMP/mem.txt" | sort -n | head -1); most swap used MB: $(awk '{print $2}' "$RUNNER_TEMP/mem.txt" | sort -n | tail -1)"
             du -sh CLI/.build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
