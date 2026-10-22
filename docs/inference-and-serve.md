@@ -24,6 +24,10 @@ let model = try InferenceModel(model: healedModel, overlay: AdapterOverlay(heale
   [swift-jinja](https://github.com/huggingface/swift-jinja) (the package's one new dependency). swift-jinja 2.5 does not
   apply `{{-` / `-}}` whitespace control next to braces, so the source is normalized first; the output then equals Python
   jinja2's byte for byte on system prompts, thinking, content parts, tool declarations, calls and replies (tested).
+- **Control tokens in messages**: text in a message (system, user, assistant, tool calls and replies, tool declarations)
+  is data. `InferenceRuntime.promptTokens` escapes every special-token string in it (`<turn|>`, `<|channel>`, `<bos>`, ...)
+  before templating and encodes it as the plain characters it spells, so a message cannot forge a turn boundary; only the
+  template's own markup yields special ids. `POST /apply-template` returns text and is unchanged.
 - **Decode**: chunked prefill, then one token at a time over a KV cache (sliding layers mask to the window, so they are
   right past it); the previous request's cache is reused for a shared prompt prefix. Sampling is greedy, or temperature,
   top-k and top-p with a seed, defaulting to the model's `generation_config.json`. Stops on EOS ids and stop strings;
