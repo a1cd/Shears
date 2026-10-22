@@ -9,16 +9,24 @@ on:
     paths:
       - ".github/workflows/linux-cuda.yml"
       - ".github/scripts/package-linux-cuda.sh"
+      - ".github/scripts/nvcc-wrapper.sh"
+      - ".github/scripts/ccache-toolchain.sh"
       - ".github/actions/setup-linux/**"
+      - ".github/actions/setup-cuda/**"
       - "Sources/**"
       - "CLI/**"
       - "Package.swift"
       - "Package.resolved"
       - "Notebooks/mlx-swift-linux-cpu.patch"
   workflow_dispatch:
+    inputs:
+      archs:
+        description: "Compute capabilities to build device code for. Default all three; \"75\" is a quick build for a T4 test (about a third of the nvcc time) and is never published."
+        default: "75 80 90"
+        type: string
 
 concurrency:
-  group: linux-cuda-${{ github.ref }}
+  group: linux-cuda-${{ github.ref }}-${{ inputs.archs }}
   cancel-in-progress: true
 
 permissions:
@@ -35,7 +43,7 @@ env:
   # 90 = H100. MLX chooses its sm_80 and sm_90 kernels at run time from the GPU's compute capability, and their bodies exist
   # only in device code built for an architecture >= 80, so a build for 75 alone would be wrong (not just slow) on an A100.
   # PTX for the last one lets newer GPUs (Blackwell) compile at first use.
-  SHEARS_CUDA_ARCHS: "75 80 90"
+  SHEARS_CUDA_ARCHS: ${{ inputs.archs || '75 80 90' }}
   # Versions MLX's own CMake build pins for the headers its SwiftPM build does not fetch.
   CUTLASS_TAG: v4.4.2
   CUDNN_FRONTEND_TAG: v1.16.0
@@ -49,119 +57,86 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: |
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          df -h / | tail -1
-
       - uses: ./.github/actions/setup-linux
 
-      - name: CUDA toolkit 13.0 (NVIDIA apt repository)
-        run: |
-          cd "$RUNNER_TEMP"
-          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            cuda-nvcc-$CUDA_PACKAGE_VERSION cuda-cudart-dev-$CUDA_PACKAGE_VERSION cuda-nvrtc-dev-$CUDA_PACKAGE_VERSION \
-            cuda-driver-dev-$CUDA_PACKAGE_VERSION libcublas-dev-$CUDA_PACKAGE_VERSION cuda-cccl-$CUDA_PACKAGE_VERSION \
-            cuda-cuobjdump-$CUDA_PACKAGE_VERSION cuda-nvdisasm-$CUDA_PACKAGE_VERSION \
-            cuda-nvtx-$CUDA_PACKAGE_VERSION libcufft-dev-$CUDA_PACKAGE_VERSION
-          if ! sudo apt-get install -y -qq --no-install-recommends \
-               libcudnn9-dev-cuda-13=$CUDNN_VERSION libcudnn9-cuda-13=$CUDNN_VERSION libcudnn9-headers-cuda-13=$CUDNN_VERSION; then
-            echo "::warning::cuDNN $CUDNN_VERSION is not in the repository any more; installing the newest"
-            sudo apt-get install -y -qq --no-install-recommends libcudnn9-dev-cuda-13
-          fi
-          # The SwiftPM manifest hard-codes /usr/local/cuda.
-          [ -e /usr/local/cuda ] || sudo ln -s /usr/local/cuda-13.0 /usr/local/cuda
-          /usr/local/cuda/bin/nvcc --version
-          ls /usr/local/cuda/include/cccl | head || true
-          dpkg -l | grep -E 'libcudnn|libcublas|cuda-nvrtc|cuda-cudart' | awk '{print $2, $3}'
-          df -h / | tail -1
+      # CUDA toolkit, the headers SwiftPM does not fetch, the nvcc wrapper. The runner has 80 GB free before the job starts,
+      # so there is no disk to free (the step that did cost 161 s).
+      - uses: ./.github/actions/setup-cuda
+        id: cuda
 
-      - name: Headers the SwiftPM build does not fetch (CUTLASS, cudnn-frontend, CCCL)
-        run: |
-          INC=/usr/local/cuda/include
-          T="$RUNNER_TEMP/cudadeps"; mkdir -p "$T"
-          git clone -q --depth 1 --branch "$CUTLASS_TAG" https://github.com/NVIDIA/cutlass.git "$T/cutlass"
-          sudo cp -r "$T/cutlass/include/cutlass" "$T/cutlass/include/cute" "$INC/"
-          git clone -q --depth 1 --branch "$CUDNN_FRONTEND_TAG" https://github.com/NVIDIA/cudnn-frontend.git "$T/fe"
-          # the whole include directory: cudnn_frontend.h includes a dozen top-level cudnn_frontend_*.h files
-          sudo cp -r "$T/fe/include/." "$INC/"
-          # The toolkit ships its own CCCL under include/cccl; MLX pins another. Overwrite it with the pinned one.
-          curl -fsSL -o "$T/cccl.zip" "https://github.com/NVIDIA/cccl/releases/download/$CCCL_TAG/cccl-$CCCL_TAG.zip"
-          unzip -q "$T/cccl.zip" -d "$T/cccl"
-          CCCL_INC=$(ls -d "$T"/cccl/*/include "$T"/cccl/include 2>/dev/null | head -1)
-          echo "CCCL headers in $CCCL_INC"
-          grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$CCCL_INC/cuda/std/__cccl/" 2>/dev/null | head -3 || true
-          echo "toolkit's own CCCL version:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" 2>/dev/null | head -3 || true
-          # licenses of the open-source headers that go into the tarball (MLX's run-time kernel compiler needs them)
-          mkdir -p "$T/licenses"
-          cp "$T/cutlass/LICENSE.txt" "$T/licenses/CUTLASS-LICENSE.txt"
-          curl -fsSL -o "$T/licenses/CCCL-LICENSE.txt" "https://raw.githubusercontent.com/NVIDIA/cccl/$CCCL_TAG/LICENSE"
-          echo "SHEARS_EXTRA_LICENSES=$T/licenses" >> "$GITHUB_ENV"
-          sudo mkdir -p "$INC/cccl"
-          sudo cp -r "$CCCL_INC"/. "$INC/cccl/"
-          echo "CCCL now in $INC/cccl:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" | head -3 || true
-          ls "$INC" | grep -E 'cutlass|cute|cudnn_frontend|cccl'
+      # What does not change when only Shears does: MLX's CUDA backend. Cached as the SwiftPM build directory (SwiftPM then
+      # skips every nvcc and clang job whose inputs are unchanged, so only Shears is compiled and linked), plus, underneath
+      # it, two content-addressed caches that do not depend on file times: the nvcc wrapper's (one .cpp per .cu) and ccache's
+      # (every clang compile). If SwiftPM decides to redo work anyway, those make it cost minutes instead of an hour. The key
+      # is what the build depends on (the salt: toolkit, headers, host compiler, MLX, architectures; see setup-cuda) and the
+      # package manifests, not the commit, so one entry is written per combination, by the first run that misses.
+      - name: Restore the CUDA build and compiler caches
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            CLI/.build
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: cuda-build-${{ steps.cuda.outputs.salt }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift') }}
+          restore-keys: cuda-build-${{ steps.cuda.outputs.salt }}-
 
-      - name: cuda_jit_sources.h (MLX's CMake generates it; the SwiftPM build does not find the shipped copy)
+      # nvcc --threads 3 compiles the architectures of one file in parallel: 1171 s instead of 2147 s for the 98 .cu files
+      # (measured on this runner, nvcc alone, 3 files at once). It also took the runner down to 357 MB of free RAM, which is
+      # why there is swap: running out of memory then slows the build instead of killing it.
+      - name: Swap file (headroom for nvcc --threads)
         run: |
-          # The .cu and .cpp files include it, and neither the CudaBuild plugin nor the C++ settings give it a search path.
-          # Regenerate it exactly as MLX's CMake does, compare with the copy mlx-swift ships, and put it where the compilers look.
-          d="$HOME/mlx-swift/Source/Cmlx/mlx/mlx/backend/cuda"
-          mkdir -p "$RUNNER_TEMP/jit" && cd "$RUNNER_TEMP/jit"
-          files=$(cd "$d" && ls device/*.h device/*.cuh | paste -sd: -)
-          cmake -DMLX_SOURCE_ROOT="$d" -DMLX_JIT_SOURCES="$files" -P "$d/bin2h.cmake"
-          ls -l gen/cuda_jit_sources.h
-          if cmp -s gen/cuda_jit_sources.h "$HOME/mlx-swift/Source/Cmlx/mlx-generated/cuda/cuda_jit_sources.h"; then
-            echo "identical to mlx-swift's shipped copy"
-          else
-            echo "differs from mlx-swift's shipped copy (using the regenerated one)"
-          fi
-          sudo cp gen/cuda_jit_sources.h /usr/local/cuda/include/
-
-      - name: nvcc wrapper (one architecture list for the compile and the device-link step)
-        run: |
-          # encuda passes a single "-arch sm_NN" to nvcc, for compiling and for the device link. This wrapper replaces it with
-          # one -gencode per architecture in SHEARS_CUDA_ARCHS, so both steps get the same list, and allows the Swift
-          # toolchain's clang as the host compiler even if this nvcc has not heard of its version.
-          mkdir -p "$HOME/nvcc-wrapper"
-          cat > "$HOME/nvcc-wrapper/nvcc" <<'EOF'
-          #!/usr/bin/env bash
-          args=(); skip=0
-          for a in "$@"; do
-            if [ "$skip" = 1 ]; then skip=0; continue; fi
-            if [ "$a" = "-arch" ]; then skip=1; continue; fi
-            args+=("$a")
-          done
-          gen=(); last=""
-          for a in $SHEARS_CUDA_ARCHS; do last=$a; done
-          for a in $SHEARS_CUDA_ARCHS; do
-            if [ "$a" = "$last" ]; then gen+=(-gencode "arch=compute_$a,code=[sm_$a,compute_$a]"); else gen+=(-gencode "arch=compute_$a,code=sm_$a"); fi
-          done
-          exec /usr/local/cuda/bin/nvcc -allow-unsupported-compiler "${gen[@]}" "${args[@]}"
-          EOF
-          chmod +x "$HOME/nvcc-wrapper/nvcc"
-          cat "$HOME/nvcc-wrapper/nvcc"
+          sudo fallocate -l 12G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
+          free -m
+          # redirected completely, or the step would wait for the background loop's stderr pipe
+          ( while sleep 10; do free -m | awk '/Mem:/{a=$7} /Swap:/{u=$3} END{print a, u}'; done ) > "$RUNNER_TEMP/mem.txt" 2>&1 < /dev/null &
 
       - name: swift build shears-cli (CUDA)
+        id: build
         working-directory: CLI
         env:
           SPM_CUDA: "1"
           CUDA_ARCH: sm_75   # read by encuda; the wrapper above replaces it
+          SHEARS_NVCC_THREADS: "3"
         run: |
           export PATH="$HOME/nvcc-wrapper:/usr/local/cuda/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           command -v nvcc
           swift package resolve
-          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # a restored CLI/.build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           start=$(date +%s)
           # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
           # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
+          export SHEARS_NVCC_LOG="$RUNNER_TEMP/nvcc.log"
           swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcufft
-          echo "release build: $(( $(date +%s) - start )) s"
+          echo "release build: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Saved right after the build, so a later failing check does not lose it. Only a miss writes (entries are immutable).
+      - name: Save the CUDA build and compiler caches
+        if: always() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            CLI/.build
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Cache report
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }})"
+            echo '```'
+            echo "release build: ${{ steps.build.outcome }}"
+            awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
+            ccache -s | grep -E 'Hits|Misses|Cache size'
+            echo "lowest available RAM MB: $(awk '{print $1}' "$RUNNER_TEMP/mem.txt" | sort -n | head -1); most swap used MB: $(awk '{print $2}' "$RUNNER_TEMP/mem.txt" | sort -n | tail -1)"
+            du -sh CLI/.build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bundle (NVIDIA libraries are not bundled)
         run: .github/scripts/package-linux-cuda.sh CLI/.build/release/shears-cli
@@ -267,7 +242,7 @@ jobs:
   # Publishing: pushes to cuda-binary and main only, after the build. A PRE-RELEASE, replaced on every run.
   publish:
     name: Publish the experimental CUDA tarball (pre-release)
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/cuda-binary' || github.ref == 'refs/heads/main') }}
     needs: build
     runs-on: ubuntu-24.04
     permissions:

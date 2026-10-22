@@ -1,0 +1,126 @@
+name: CUDA 13.0 toolkit and the build helpers for mlx-swift's CUDA backend
+description: >
+  Run after setup-linux. Installs the CUDA toolkit and cuDNN from NVIDIA's apt repository, puts the headers the SwiftPM
+  build does not fetch (CUTLASS, cudnn-frontend, CCCL) and the generated cuda_jit_sources.h where the compilers look,
+  installs the nvcc wrapper (architectures, per-file cache, timing) as $HOME/nvcc-wrapper/nvcc, and exports
+  SHEARS_NVCC_SALT: a hash of everything the nvcc outputs depend on that is not an argument. Needs the workflow's
+  env: CUDA_PACKAGE_VERSION, CUDNN_VERSION, SHEARS_CUDA_ARCHS, CUTLASS_TAG, CUDNN_FRONTEND_TAG, CCCL_TAG.
+outputs:
+  salt:
+    description: Hash of the toolkit, headers, host compiler, MLX sources, architectures and the nvcc wrapper.
+    value: ${{ steps.salt.outputs.salt }}
+runs:
+  using: composite
+  steps:
+    - name: CUDA toolkit 13.0 (NVIDIA apt repository)
+      shell: bash
+      run: |
+        cd "$RUNNER_TEMP"
+        curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends \
+          cuda-nvcc-$CUDA_PACKAGE_VERSION cuda-cudart-dev-$CUDA_PACKAGE_VERSION cuda-nvrtc-dev-$CUDA_PACKAGE_VERSION \
+          cuda-driver-dev-$CUDA_PACKAGE_VERSION libcublas-dev-$CUDA_PACKAGE_VERSION cuda-cccl-$CUDA_PACKAGE_VERSION \
+          cuda-cuobjdump-$CUDA_PACKAGE_VERSION cuda-nvdisasm-$CUDA_PACKAGE_VERSION \
+          cuda-nvtx-$CUDA_PACKAGE_VERSION libcufft-dev-$CUDA_PACKAGE_VERSION
+        if ! sudo apt-get install -y -qq --no-install-recommends \
+             libcudnn9-dev-cuda-13=$CUDNN_VERSION libcudnn9-cuda-13=$CUDNN_VERSION libcudnn9-headers-cuda-13=$CUDNN_VERSION; then
+          echo "::warning::cuDNN $CUDNN_VERSION is not in the repository any more; installing the newest"
+          sudo apt-get install -y -qq --no-install-recommends libcudnn9-dev-cuda-13
+        fi
+        # The SwiftPM manifest hard-codes /usr/local/cuda.
+        [ -e /usr/local/cuda ] || sudo ln -s /usr/local/cuda-13.0 /usr/local/cuda
+        /usr/local/cuda/bin/nvcc --version
+        ls /usr/local/cuda/include/cccl | head || true
+        dpkg -l | grep -E 'libcudnn|libcublas|cuda-nvrtc|cuda-cudart' | awk '{print $2, $3}'
+
+    - name: Headers the SwiftPM build does not fetch (CUTLASS, cudnn-frontend, CCCL)
+      shell: bash
+      run: |
+        INC=/usr/local/cuda/include
+        T="$RUNNER_TEMP/cudadeps"; mkdir -p "$T"
+        git clone -q --depth 1 --branch "$CUTLASS_TAG" https://github.com/NVIDIA/cutlass.git "$T/cutlass"
+        sudo cp -r "$T/cutlass/include/cutlass" "$T/cutlass/include/cute" "$INC/"
+        git clone -q --depth 1 --branch "$CUDNN_FRONTEND_TAG" https://github.com/NVIDIA/cudnn-frontend.git "$T/fe"
+        # the whole include directory: cudnn_frontend.h includes a dozen top-level cudnn_frontend_*.h files
+        sudo cp -r "$T/fe/include/." "$INC/"
+        # The toolkit ships its own CCCL under include/cccl; MLX pins another. Overwrite it with the pinned one.
+        curl -fsSL -o "$T/cccl.zip" "https://github.com/NVIDIA/cccl/releases/download/$CCCL_TAG/cccl-$CCCL_TAG.zip"
+        unzip -q "$T/cccl.zip" -d "$T/cccl"
+        CCCL_INC=$(ls -d "$T"/cccl/*/include "$T"/cccl/include 2>/dev/null | head -1 || true)   # composite steps run with pipefail: ls exits 2 for the missing one
+        echo "CCCL headers in $CCCL_INC"
+        grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$CCCL_INC/cuda/std/__cccl/" 2>/dev/null | head -3 || true
+        echo "toolkit's own CCCL version:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" 2>/dev/null | head -3 || true
+        # licenses of the open-source headers that go into the tarball (MLX's run-time kernel compiler needs them)
+        mkdir -p "$T/licenses"
+        cp "$T/cutlass/LICENSE.txt" "$T/licenses/CUTLASS-LICENSE.txt"
+        curl -fsSL -o "$T/licenses/CCCL-LICENSE.txt" "https://raw.githubusercontent.com/NVIDIA/cccl/$CCCL_TAG/LICENSE"
+        echo "SHEARS_EXTRA_LICENSES=$T/licenses" >> "$GITHUB_ENV"
+        sudo mkdir -p "$INC/cccl"
+        sudo cp -r "$CCCL_INC"/. "$INC/cccl/"
+        echo "CCCL now in $INC/cccl:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" | head -3 || true
+        ls "$INC" | grep -E 'cutlass|cute|cudnn_frontend|cccl'
+
+    - name: cuda_jit_sources.h (MLX's CMake generates it; the SwiftPM build does not find the shipped copy)
+      shell: bash
+      run: |
+        # The .cu and .cpp files include it, and neither the CudaBuild plugin nor the C++ settings give it a search path.
+        # Regenerate it exactly as MLX's CMake does, compare with the copy mlx-swift ships, and put it where the compilers look.
+        d="$HOME/mlx-swift/Source/Cmlx/mlx/mlx/backend/cuda"
+        mkdir -p "$RUNNER_TEMP/jit" && cd "$RUNNER_TEMP/jit"
+        files=$(cd "$d" && ls device/*.h device/*.cuh | paste -sd: -)
+        cmake -DMLX_SOURCE_ROOT="$d" -DMLX_JIT_SOURCES="$files" -P "$d/bin2h.cmake"
+        ls -l gen/cuda_jit_sources.h
+        if cmp -s gen/cuda_jit_sources.h "$HOME/mlx-swift/Source/Cmlx/mlx-generated/cuda/cuda_jit_sources.h"; then
+          echo "identical to mlx-swift's shipped copy"
+        else
+          echo "differs from mlx-swift's shipped copy (using the regenerated one)"
+        fi
+        sudo cp gen/cuda_jit_sources.h /usr/local/cuda/include/
+
+    - name: Pin the times of the headers this action installed
+      shell: bash
+      run: |
+        # SwiftPM's build database (restored with CLI/.build) records the time of every header a compile read. These were
+        # just copied in, so their times are new on every run and every file that reads one would be rebuilt. Give the files
+        # written in the last hour (the headers above; the apt packages are older) one fixed time, the same on every run.
+        sudo find /usr/local/cuda/include -type f -newermt '2 hours ago' -exec touch -h -d '2020-01-01 00:00:00 UTC' {} +
+        echo "files in /usr/local/cuda/include newer than the pin: $(find /usr/local/cuda/include -type f -newermt '2020-01-02' | wc -l) (the toolkit's own, from the packages)"
+
+    - name: nvcc wrapper (one architecture list for the compile and the device-link step; per-file cache; timing)
+      shell: bash
+      run: |
+        # encuda passes a single "-arch sm_NN" to nvcc, for compiling and for the device link. The wrapper replaces it with
+        # one -gencode per architecture in SHEARS_CUDA_ARCHS and caches the two expensive calls by content. See the script.
+        mkdir -p "$HOME/nvcc-wrapper"
+        cp "$GITHUB_WORKSPACE/.github/scripts/nvcc-wrapper.sh" "$HOME/nvcc-wrapper/nvcc"
+        chmod +x "$HOME/nvcc-wrapper/nvcc"
+
+    - name: Salt for the nvcc cache and the cache key
+      id: salt
+      shell: bash
+      run: |
+        # Everything an nvcc output depends on that is not one of its arguments or inputs. If any of it changes, the
+        # per-file cache is not consulted for the old entries (they stay in the cache until ccache-style trimming; the
+        # workflow keys the whole cache on this value, so they are not restored either).
+        tc=$(ls -d "$HOME"/.local/share/swiftly/toolchains/*/usr/bin | head -1)
+        clang_real=$(grep -o 'exec ccache "[^"]*"' "$tc/clang" 2>/dev/null | cut -d'"' -f2 || true)
+        [ -n "$clang_real" ] || clang_real="$tc/clang"
+        salt=$({
+          echo "wrapper $(sha256sum "$GITHUB_WORKSPACE/.github/scripts/nvcc-wrapper.sh" | cut -d' ' -f1)"
+          echo "archs $SHEARS_CUDA_ARCHS"
+          echo "tags $CUTLASS_TAG $CUDNN_FRONTEND_TAG $CCCL_TAG"
+          /usr/local/cuda/bin/nvcc --version
+          "$clang_real" --version
+          dpkg-query -W -f='${Package} ${Version}\n' | grep -E '^(cuda-|libcublas|libcudnn|libcufft|libnvptx|libnvvm)' | sort
+          echo "mlx-swift $(git -C "$HOME/mlx-swift" rev-parse HEAD)"
+          sha256sum "$GITHUB_WORKSPACE/Notebooks/mlx-swift-linux-cpu.patch" | cut -d' ' -f1
+          sha256sum /usr/local/cuda/include/cuda_jit_sources.h | cut -d' ' -f1
+        } | tee "$RUNNER_TEMP/salt-inputs.txt" | sha256sum | cut -c1-32)
+        echo "salt=$salt" >> "$GITHUB_OUTPUT"
+        echo "SHEARS_NVCC_SALT=$salt" >> "$GITHUB_ENV"
+        echo "SHEARS_NVCC_CACHE=$HOME/.cache/shears-nvcc" >> "$GITHUB_ENV"
+        echo "SHEARS_CUDA_ARCHS=$SHEARS_CUDA_ARCHS" >> "$GITHUB_ENV"
+        echo "salt $salt from:"; cat "$RUNNER_TEMP/salt-inputs.txt"
+        mkdir -p "$HOME/.cache/shears-nvcc"
