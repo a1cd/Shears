@@ -79,11 +79,10 @@ jobs:
             ~/.cache/ccache
             ~/.cache/shears-nvcc
           key: cuda-build-${{ steps.cuda.outputs.salt }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift') }}
-          restore-keys: |
-            cuda-build-${{ steps.cuda.outputs.salt }}-
-            cuda-compilers-${{ steps.cuda.outputs.salt }}
+          restore-keys: cuda-build-${{ steps.cuda.outputs.salt }}-
 
       - name: swift build shears-cli (CUDA)
+        id: build
         working-directory: CLI
         env:
           SPM_CUDA: "1"
@@ -100,20 +99,11 @@ jobs:
           # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
           export SHEARS_NVCC_LOG="$RUNNER_TEMP/nvcc.log"
           swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcufft
-          echo "release build: $(( $(date +%s) - start )) s"
-          {
-            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }})"
-            echo '```'
-            echo "release build: $(( $(date +%s) - start )) s"
-            awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
-            ccache -s | grep -E 'Hits|Misses|Cache size'
-            du -sh CLI/.build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "release build: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # Saved right after the build, so a later failing check does not lose it. Only a miss writes (entries are immutable).
       - name: Save the CUDA build and compiler caches
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: always() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -121,6 +111,20 @@ jobs:
             ~/.cache/ccache
             ~/.cache/shears-nvcc
           key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Cache report
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }})"
+            echo '```'
+            echo "release build: ${{ steps.build.outcome }}"
+            awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
+            ccache -s | grep -E 'Hits|Misses|Cache size'
+            du -sh CLI/.build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Bundle (NVIDIA libraries are not bundled)
         run: .github/scripts/package-linux-cuda.sh CLI/.build/release/shears-cli

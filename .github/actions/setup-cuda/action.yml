@@ -113,7 +113,7 @@ runs:
           echo "tags $CUTLASS_TAG $CUDNN_FRONTEND_TAG $CCCL_TAG"
           /usr/local/cuda/bin/nvcc --version
           "$clang_real" --version
-          dpkg-query -W -f='${Package} ${Version}\n' | grep -E '^(cuda-|libcu|libnv)' | sort
+          dpkg-query -W -f='${Package} ${Version}\n' | grep -E '^(cuda-|libcublas|libcudnn|libcufft|libnvptx|libnvvm)' | sort
           echo "mlx-swift $(git -C "$HOME/mlx-swift" rev-parse HEAD)"
           sha256sum "$GITHUB_WORKSPACE/Notebooks/mlx-swift-linux-cpu.patch" | cut -d' ' -f1
           sha256sum /usr/local/cuda/include/cuda_jit_sources.h | cut -d' ' -f1
