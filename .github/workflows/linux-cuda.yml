@@ -66,7 +66,8 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             cuda-nvcc-$CUDA_PACKAGE_VERSION cuda-cudart-dev-$CUDA_PACKAGE_VERSION cuda-nvrtc-dev-$CUDA_PACKAGE_VERSION \
             cuda-driver-dev-$CUDA_PACKAGE_VERSION libcublas-dev-$CUDA_PACKAGE_VERSION cuda-cccl-$CUDA_PACKAGE_VERSION \
-            cuda-cuobjdump-$CUDA_PACKAGE_VERSION cuda-nvdisasm-$CUDA_PACKAGE_VERSION
+            cuda-cuobjdump-$CUDA_PACKAGE_VERSION cuda-nvdisasm-$CUDA_PACKAGE_VERSION \
+            cuda-nvtx-$CUDA_PACKAGE_VERSION
           if ! sudo apt-get install -y -qq --no-install-recommends \
                libcudnn9-dev-cuda-13=$CUDNN_VERSION libcudnn9-cuda-13=$CUDNN_VERSION libcudnn9-headers-cuda-13=$CUDNN_VERSION; then
             echo "::warning::cuDNN $CUDNN_VERSION is not in the repository any more; installing the newest"
@@ -86,7 +87,8 @@ jobs:
           git clone -q --depth 1 --branch "$CUTLASS_TAG" https://github.com/NVIDIA/cutlass.git "$T/cutlass"
           sudo cp -r "$T/cutlass/include/cutlass" "$T/cutlass/include/cute" "$INC/"
           git clone -q --depth 1 --branch "$CUDNN_FRONTEND_TAG" https://github.com/NVIDIA/cudnn-frontend.git "$T/fe"
-          sudo cp -r "$T/fe/include/cudnn_frontend" "$T/fe/include/cudnn_frontend.h" "$INC/"
+          # the whole include directory: cudnn_frontend.h includes a dozen top-level cudnn_frontend_*.h files
+          sudo cp -r "$T/fe/include/." "$INC/"
           # The toolkit ships its own CCCL under include/cccl; MLX pins another. Overwrite it with the pinned one.
           curl -fsSL -o "$T/cccl.zip" "https://github.com/NVIDIA/cccl/releases/download/$CCCL_TAG/cccl-$CCCL_TAG.zip"
           unzip -q "$T/cccl.zip" -d "$T/cccl"
