@@ -1,0 +1,219 @@
+name: Linux
+
+# Builds shears-cli for Linux x86_64 (CPU, MLX), runs the test suite, and runs the Colab notebook
+# headless against the prebuilt binary on a runner with no Swift. See docs/linux.md.
+on:
+  push:
+    branches: [prebuilt-binary, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SPM_CUDA: "0"   # without it the mlx-swift build looks for cuda.h and fails
+
+jobs:
+  build:
+    name: Build shears-cli (release, static Swift runtime)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-linux
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: CLI/.build
+          key: spm-cli-${{ runner.arch }}-${{ hashFiles('Package.swift', 'CLI/Package.swift', 'Notebooks/mlx-swift-linux-cpu.patch') }}-${{ github.sha }}
+          restore-keys: |
+            spm-cli-${{ runner.arch }}-${{ hashFiles('Package.swift', 'CLI/Package.swift', 'Notebooks/mlx-swift-linux-cpu.patch') }}-
+
+      - name: swift build shears-cli
+        working-directory: CLI
+        run: |
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          start=$(date +%s)
+          swift build -c release --product shears-cli --static-swift-stdlib
+          echo "release build: $(( $(date +%s) - start )) s"
+
+      - name: Bundle
+        run: .github/scripts/package-linux.sh CLI/.build/release/shears-cli
+
+      - name: Smoke test the unpacked tarball
+        run: |
+          d=$(mktemp -d)
+          tar -xzf dist/shears-cli-linux-x86_64.tar.gz -C "$d"
+          env -u LD_LIBRARY_PATH "$d/shears-cli-linux-x86_64/bin/shears-cli" sample "$d/tiny"
+          ls "$d/tiny"
+
+      - name: Summary
+        run: |
+          f=dist/shears-cli-linux-x86_64.tar.gz
+          {
+            echo "### shears-cli, Linux x86_64"
+            echo
+            echo "tarball: $(du -h "$f" | cut -f1) ($(stat -c %s "$f") bytes)"
+            echo
+            echo '```'
+            cat "$f.sha256"
+            echo
+            cat dist/shears-cli-linux-x86_64/BUILD_INFO.txt
+            echo
+            echo "ldd (bundle, no LD_LIBRARY_PATH):"
+            cat dist/ldd.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64
+          path: |
+            dist/shears-cli-linux-x86_64.tar.gz
+            dist/shears-cli-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  test:
+    name: swift test (CPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-linux
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-test-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Notebooks/mlx-swift-linux-cpu.patch') }}-${{ github.sha }}
+          restore-keys: |
+            spm-test-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Notebooks/mlx-swift-linux-cpu.patch') }}-
+
+      - name: swift test
+        run: |
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # The verdict step below decides; keep the exit status for it.
+          set +e
+          swift test 2>&1 | tee swift-test.log
+          echo "${PIPESTATUS[0]}" > swift-test.status
+          exit 0
+
+      # Fails the job unless the only failures are the documented numeric-tolerance ones
+      # (KNOWN_FLAKES in the script; see docs/linux.md). A crash or a build error always fails.
+      - name: Counts and verdict
+        run: python3 -I .github/scripts/summarize_swift_test.py swift-test.log "$(cat swift-test.status)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: swift-test-log
+          path: swift-test.log
+          retention-days: 14
+
+  notebook:
+    name: Notebook on a clean runner (no Swift), prebuilt path
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64
+          path: artifact
+
+      - name: Make the runner clean
+        run: |
+          # The image may ship a Swift toolchain, and BLAS/LAPACK. Remove both, so only what the bundle
+          # and the notebook's own steps provide is there.
+          echo "swift on the image: $(command -v swift || echo none)"
+          sudo rm -rf /usr/share/swift /usr/local/swift* ~/.local/share/swiftly ~/.swiftly ~/.swift
+          for i in 1 2 3; do
+            s=$(command -v swift) || break
+            echo "removing $s"; sudo rm -f "$s" "$(dirname "$s")"/swift-* "$(dirname "$s")"/swiftc
+            hash -r
+          done
+          sudo apt-get purge -y 'libopenblas*' 'liblapack*' 'libblas*' 'libgfortran*' 2>&1 | tail -3 || true
+          hash -r
+          for t in swift swiftc swiftly; do
+            if command -v $t; then echo "$t is still present"; exit 1; fi
+          done
+          dpkg -l | grep -E 'openblas|lapack|libblas|gfortran' || echo "no BLAS/LAPACK/gfortran packages installed"
+          ldconfig -p | grep -E 'openblas|lapack|gfortran' || echo "none in the linker cache"
+          g++ --version | head -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python tools (like Colab, jupyter and CPU torch are preinstalled)
+        run: |
+          python -m pip install -q --disable-pip-version-check jupyter nbconvert ipykernel
+          python -m pip install -q --disable-pip-version-check torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run the notebook headless
+        env:
+          # Point the notebook's prebuilt path at the artifact instead of the release URL, and do not
+          # let it fall back to a source build (a green run must mean the prebuilt path worked).
+          SHEARS_PREBUILT_URL: file://${{ github.workspace }}/artifact/shears-cli-linux-x86_64.tar.gz
+          SHEARS_PREBUILT_REQUIRED: "1"
+          SHEARS_WORK: ${{ runner.temp }}/shears-work
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          cd Notebooks
+          jupyter nbconvert --to notebook --execute Shears.ipynb --output-dir "$RUNNER_TEMP/out" \
+            --ExecutePreprocessor.timeout=3600
+
+      - name: Phase times
+        if: always()
+        run: python3 -I .github/scripts/notebook_summary.py "$RUNNER_TEMP/shears-work/phases.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: executed-notebook
+          path: ${{ runner.temp }}/out/Shears.ipynb
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------------------------
+  # DISABLED: publishing. This job never runs (`if: false`). To publish, replace `false` with the
+  # condition in the comment on the `if` line. It creates the release `linux-x86_64-latest` once and
+  # then replaces its two assets on every later run. It is the only job with write access.
+  publish:
+    name: Publish the prebuilt tarball (disabled)
+    if: ${{ false }}   # enable with: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [build, test, notebook]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: linux-x86_64-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64
+          path: artifact
+
+      - name: Publish release assets
+        run: |
+          notes="Prebuilt shears-cli for Linux x86_64 (CPU), built from commit $GITHUB_SHA. Used by Notebooks/Shears.ipynb. Replaced on every push to main. Needs glibc 2.39 or newer and g++ at run time; see BUILD_INFO.txt inside the tarball."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$notes"
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "shears-cli for Linux x86_64 (latest)" --notes "$notes"
+          fi
+          gh release upload "$TAG" artifact/shears-cli-linux-x86_64.tar.gz artifact/shears-cli-linux-x86_64.tar.gz.sha256 --clobber

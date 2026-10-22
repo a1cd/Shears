@@ -1,0 +1,82 @@
+name: Linux Swift and patched mlx-swift
+description: >
+  Installs the system packages and Swift 6.3.3 (swiftly), and prepares $HOME/mlx-swift (the
+  version Shears is pinned to, with Notebooks/mlx-swift-linux-cpu.patch applied and
+  compiled_preamble.cpp regenerated for this CPU). Same steps as the Linux cells of
+  Notebooks/Shears.ipynb and docs/linux.md.
+inputs:
+  swift-version:
+    description: Swift toolchain version
+    default: "6.3.3"
+runs:
+  using: composite
+  steps:
+    - name: System packages
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq build-essential git curl ca-certificates python3 pkg-config binutils gnupg2 unzip tzdata \
+          zlib1g-dev libncurses-dev libedit2 libsqlite3-0 libcurl4-openssl-dev libxml2-dev libz3-dev \
+          libopenblas-dev liblapacke-dev gfortran ninja-build libstdc++-13-dev libgcc-13-dev patchelf
+        g++ --version | head -1
+
+    - name: Cache the Swift toolchain
+      id: swift-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.local/share/swiftly
+          ~/.config/swiftly
+        key: swiftly-${{ runner.os }}-${{ runner.arch }}-${{ inputs.swift-version }}
+
+    - name: Install Swift ${{ inputs.swift-version }}
+      shell: bash
+      env:
+        SWIFT_VERSION: ${{ inputs.swift-version }}
+      run: |
+        echo "$HOME/.local/share/swiftly/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/share/swiftly/bin:$PATH"
+        echo "swift before install: $(command -v swift || echo none)"
+        if ! swift --version 2>&1 | grep -q "Swift version $SWIFT_VERSION"; then
+          mkdir -p "$RUNNER_TEMP/swiftly" && cd "$RUNNER_TEMP/swiftly"
+          curl -sSLO "https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz"
+          tar zxf "swiftly-$(uname -m).tar.gz"
+          ./swiftly init --quiet-shell-followup --assume-yes --skip-install
+          . ~/.local/share/swiftly/env.sh
+          swiftly install --use --assume-yes "$SWIFT_VERSION"
+        fi
+        hash -r
+        echo "swift in use: $(command -v swift)"
+        swift --version
+        swift --version 2>&1 | grep -q "Swift version $SWIFT_VERSION"
+
+    - name: Read the pinned mlx-swift version
+      id: mlx
+      shell: bash
+      run: |
+        v=$(python3 -c 'import json;print(next(p["state"]["version"] for p in json.load(open("Package.resolved"))["pins"] if p["identity"]=="mlx-swift"))')
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+        echo "mlx-swift $v"
+
+    - name: Cache patched mlx-swift
+      id: mlx-cache
+      uses: actions/cache@v4
+      with:
+        path: ~/mlx-swift
+        key: mlx-swift-${{ runner.arch }}-${{ steps.mlx.outputs.version }}-${{ hashFiles('Notebooks/mlx-swift-linux-cpu.patch') }}
+
+    - name: Patch mlx-swift
+      if: steps.mlx-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        MLX_VERSION: ${{ steps.mlx.outputs.version }}
+      run: |
+        rm -rf ~/mlx-swift
+        git clone --quiet --depth 1 --branch "$MLX_VERSION" --recurse-submodules --shallow-submodules \
+          https://github.com/ml-explore/mlx-swift ~/mlx-swift
+        cd ~/mlx-swift
+        # 1. MLXNN needs MLXFast, which the Linux CPU manifest leaves out.
+        git apply "$GITHUB_WORKSPACE/Notebooks/mlx-swift-linux-cpu.patch"
+        # 2. The shipped compiled_preamble.cpp was generated on arm64; regenerate it for this CPU.
+        cd Source/Cmlx
+        bash mlx/mlx/backend/cpu/make_compiled_preamble.sh mlx-generated/compiled_preamble.cpp g++ mlx FALSE "$(uname -m)"
