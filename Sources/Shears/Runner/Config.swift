@@ -94,6 +94,10 @@ public struct RunnerConfig: Decodable {
         public var teacherStateBudgetGB: Double?
         /// Pad the teacher walk's batches to a few fixed shapes (default true; see `BlockPipelineOptions.padWalks`).
         public var padWalks: Bool?
+        /// One sequence length for every teacher walk, frontier batch and compiled training step: a token count, `auto` (the
+        /// longest row rounded up to a multiple of 64) or `buckets` (rows padded to the nearest of a fine set of lengths). The
+        /// default is `auto` on Linux with a GPU (MLX's CUDA backend compiles per shape) and `buckets` elsewhere.
+        public var sequenceLength: LooseString?
         /// Where the frontier (the states entering the current block, clean and dirty, for every row), the
         /// manifest, block adapters and checkpoints go. It can be large: about 2 x rows x tokens x hidden x
         /// bytes. Default: `pipeline` under the output directory.
@@ -269,6 +273,15 @@ public struct RunnerConfig: Decodable {
     }
 }
 
+/// A JSON string or whole number, read as a string (`"auto"`, `"512"` or `512`).
+public struct LooseString: Decodable {
+    public var value: String
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let s = try? c.decode(String.self) { value = s } else { value = String(try c.decode(Int.self)) }
+    }
+}
+
 /// The key tree the strict check walks.
 enum Schema {
     indirect enum Node {
@@ -299,7 +312,7 @@ enum Schema {
         "pipeline": leaves([
             "steps", "batchSteps", "mix", "learningRate", "learningRateFloor", "warmup", "scheduleLength", "weightDecay",
             "maxLoss", "checkpointBlocks", "keepIntermediates", "checkpointEvery", "storageDType", "maxBatchTokens", "maxBatchRows", "directory",
-            "maxBlocks", "rowsPerStep", "sharedPrefix", "teacherPass", "teacherStateBudgetGB", "padWalks",
+            "maxBlocks", "rowsPerStep", "sharedPrefix", "teacherPass", "teacherStateBudgetGB", "padWalks", "sequenceLength",
         ]).withChild("plateau", leaves(["evalEvery", "patience", "threshold", "annealSteps"])),
         "sweep": leaves(["learningRates", "steps", "trainRows", "heldOutRows", "warmup", "output", "directory"])
             .withChild("variants", .array(leaves(["name", "rowsPerStep", "dtype", "routerRank", "routerLRMultiplier", "expertRank", "sharedExperts"]).withChild("plateau", leaves(["evalEvery", "patience", "threshold", "annealSteps"])))),

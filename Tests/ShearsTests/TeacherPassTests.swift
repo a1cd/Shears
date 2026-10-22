@@ -134,4 +134,27 @@ final class TeacherPassTests: ShearsTestCase {
             assertClose(a[k]!, v, atol: 1e-5, rtol: 1e-5, k)
         }
     }
+
+    /// One fixed length for every walk and step: one shape each, the same training, and a clear refusal when a row
+    /// does not fit.
+    func testFixedSequenceLengthMeetsOneShapeAndChangesNothing() throws {
+        let f = try fixture(lengths: [20, 23, 27, 31, 22, 40, 29, 21])
+        let buckets = try run(f, steps: 8, batchSteps: 4) { $0.maxBatchRows = 3 }
+        let fixed = try run(f, steps: 8, batchSteps: 4) { $0.maxBatchRows = 3; $0.fixedSequenceLength = 64 }
+        XCTAssertEqual(StreamedBlockHealer.fixedSequenceLength, nil, "the process-wide setting is put back")
+        let (a, b) = (buckets.report!, fixed.report!)
+        print("TEACHERPASS buckets: \(a.compiledTraces) traces, \(a.walkShapes) walk shapes; fixed 64: \(b.compiledTraces) traces, \(b.walkShapes) walk shapes")
+        XCTAssertLessThan(b.walkShapes, a.walkShapes)
+        XCTAssertLessThan(b.compiledTraces, a.compiledTraces)
+        XCTAssertEqual(Set(a.adapters.keys), Set(b.adapters.keys))
+        for (k, v) in a.adapters { assertClose(b.adapters[k]!, v, atol: 2e-4, rtol: 2e-3, k) }
+        for (x, y) in zip(a.blocks, b.blocks) {
+            XCTAssertEqual(x.losses.count, y.losses.count)
+            for (l1, l2) in zip(x.losses, y.losses) { XCTAssertEqual(l1, l2, accuracy: 2e-4 + 2e-3 * abs(l1)) }
+        }
+        XCTAssertThrowsError(try run(f, steps: 8, batchSteps: 4) { $0.fixedSequenceLength = 32 }) {
+            XCTAssertTrue("\($0)".contains("shorter than the longest row"), "\($0)")
+        }
+        XCTAssertEqual(StreamedBlockHealer.fixedSequenceLength, nil)
+    }
 }

@@ -24,8 +24,15 @@ extension StreamedBlockHealer {
         1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096,
     ]
 
+    /// One sequence length for every compiled step (and, in ``BlockPipeline``, every teacher walk and frontier batch): a row
+    /// of `T <= fixedSequenceLength` positions runs at exactly this length, so a run meets one shape per function instead of
+    /// one per bucket. For a backend that compiles kernels at run time (MLX's CUDA backend). A row longer than it is
+    /// refused by the pipeline up front. `nil` (the default) uses ``sequenceBuckets``.
+    nonisolated(unsafe) public static var fixedSequenceLength: Int?
+
     /// The bucket a row of `length` positions runs at.
     public static func sequenceBucket(for length: Int) -> Int {
+        if let fixed = fixedSequenceLength, length <= fixed { return fixed }
         let buckets = sequenceBuckets.sorted()
         if let b = buckets.first(where: { $0 >= length }) { return b }
         guard let last = buckets.last, last > 0 else { return length }

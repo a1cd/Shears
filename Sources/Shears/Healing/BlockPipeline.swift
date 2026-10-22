@@ -57,6 +57,12 @@ public struct BlockPipelineOptions {
     /// so no value changes (to float rounding; tested), but a backend that compiles a kernel per shape (MLX's CUDA
     /// JIT) meets a handful of shapes instead of a new one in every batch.
     public var padWalks = true
+    /// Run every teacher walk, frontier batch and compiled training step at exactly this many positions (rows padded with
+    /// zeros and masked out of the loss; the row count of a walk's batch is padded to a fixed capacity too), so the run
+    /// meets one shape per function, and a backend that compiles kernels per shape compiles each once. `nil` uses
+    /// ``StreamedBlockHealer/sequenceBuckets`` (and ``padWalks``). A row longer than this is refused before any work.
+    /// Steps of several rows (``rowsPerStep`` above 1) still stack to the longest row of the step.
+    public var fixedSequenceLength: Int?
     /// A ceiling on MLX memory. By default the whole block is resident; with a budget the window is the largest whose
     /// estimate fits it (see ``ResidencyPlanner/chooseAuto(_:otherStagesPeak:ceiling:)``), and a run whose floor is
     /// above the budget is refused with the amount it needs.
@@ -267,6 +273,10 @@ public final class BlockPipeline {
         public var trainingPeakBytes: Int
         public var frontierBytes: Int
         public var outcome: HealingOutcome = .finished
+        /// Compiled-function traces made by this run (each is a compile on a backend that compiles per shape).
+        public var compiledTraces = 0
+        /// Distinct kernel shapes the teacher walks evaluated.
+        public var walkShapes = 0
     }
 
     private var manifest: Manifest!
@@ -295,23 +305,43 @@ public final class BlockPipeline {
     /// Padded `[B, T, D]` batch of states (right-padded with zeros) and each row's length. With `bucketed` (and
     /// ``BlockPipelineOptions/padWalks``) the length is rounded up to its bucket and the rows to a power of two.
     func stack(_ states: [MLXArray], compute: DType?, bucketed: Bool = false) -> MLXArray {
+        let fixed = bucketed ? options.fixedSequenceLength : nil
         let bucket = bucketed && options.padWalks
         var longest = states.map { $0.dim(1) }.max() ?? 0
-        if bucket { longest = StreamedBlockHealer.sequenceBucket(for: longest) }
+        if let fixed { longest = max(fixed, longest) } else if bucket { longest = StreamedBlockHealer.sequenceBucket(for: longest) }
         var out = concatenated(states.map { x in
             var x = x
             if let compute, x.dtype != compute { x = x.asType(compute) }
             let pad = longest - x.dim(1)
             return pad == 0 ? x : concatenated([x, MLXArray.zeros([1, pad, x.dim(2)], dtype: x.dtype)], axis: 1)
         }, axis: 0)
-        if bucket {
-            var rows = 1
+        var rows = 1
+        if fixed != nil {
+            rows = walkRowCapacity
+        } else if bucket {
             while rows < states.count { rows *= 2 }
-            if rows > states.count, rows * longest <= options.maxBatchTokens {
-                out = concatenated([out, MLXArray.zeros([rows - states.count, out.dim(1), out.dim(2)], dtype: out.dtype)], axis: 0)
-            }
+            if rows * longest > options.maxBatchTokens { rows = states.count }
+        }
+        if rows > states.count {
+            out = concatenated([out, MLXArray.zeros([rows - states.count, out.dim(1), out.dim(2)], dtype: out.dtype)], axis: 0)
         }
         return out
+    }
+
+    /// Rows in a walk's batch when ``BlockPipelineOptions/fixedSequenceLength`` is set: as many as fit
+    /// ``BlockPipelineOptions/maxBatchTokens`` at that length, at most ``BlockPipelineOptions/maxBatchRows``.
+    var walkRowCapacity: Int {
+        guard let fixed = options.fixedSequenceLength else { return 1 }
+        return max(1, min(options.maxBatchRows, options.maxBatchTokens / max(1, fixed)))
+    }
+
+    /// The row groups of a teacher walk or frontier batch: by length, unless every row runs at one fixed length.
+    func walkGroups(lengths: [Int]) -> [[Int]] {
+        if options.fixedSequenceLength != nil {
+            let cap = walkRowCapacity
+            return stride(from: 0, to: lengths.count, by: cap).map { Array($0 ..< min(lengths.count, $0 + cap)) }
+        }
+        return TeacherPrepass.batches(lengths: lengths, maxTokens: options.maxBatchTokens, maxRows: options.maxBatchRows)
     }
 
     // MARK: run
@@ -365,6 +395,14 @@ public final class BlockPipeline {
         }
         for r in options.evalRows where seen.insert(r.key).inserted { used.append(r) }
         let longest = used.map(\.length).max() ?? 1
+        if let f = options.fixedSequenceLength, f < longest {
+            throw HealingError.invalid("sequenceLength \(f) is shorter than the longest row (\(longest) tokens); raise it, or use \"buckets\"")
+        }
+        let priorFixedLength = StreamedBlockHealer.fixedSequenceLength
+        defer { StreamedBlockHealer.fixedSequenceLength = priorFixedLength }
+        if let f = options.fixedSequenceLength { StreamedBlockHealer.fixedSequenceLength = f }
+        let tracesAtStart = CompiledLayerStep.debugTraces
+        seenWalkShapes = []
         let sharedP = try sharedPrefixLength(used)
         var fp = Fingerprint()
         for r in used { fp.add(r.key); fp.add(TeacherPrepass.fingerprint(r)) }
@@ -794,7 +832,8 @@ public final class BlockPipeline {
         return Report(
             adapters: adaptersAll, keep: keep, selections: allSelections, blocks: infos,
             otherStagesPeakBytes: manifest.otherStagesPeak, trainingPeakBytes: trainingPeak,
-            frontierBytes: store.diskBytes(), outcome: outcome)
+            frontierBytes: store.diskBytes(), outcome: outcome, compiledTraces: CompiledLayerStep.debugTraces - tracesAtStart,
+            walkShapes: seenWalkShapes.count)
     }
 
     /// Block 0's inputs: every row's embedding, written once with the table loaded once.
@@ -802,13 +841,16 @@ public final class BlockPipeline {
         let todo = rows.filter { !has("c", $0.key, 0) }
         guard !todo.isEmpty else { return }
         let embedder = try source.makeEmbedder()
-        for g in TeacherPrepass.batches(lengths: todo.map(\.length), maxTokens: options.maxBatchTokens, maxRows: options.maxBatchRows) {
+        for g in walkGroups(lengths: todo.map(\.length)) {
             let batch = g.map { todo[$0] }
-            let longest = batch.map(\.length).max()!
-            let tokens = concatenated(batch.map { r -> MLXArray in
+            let longest = options.fixedSequenceLength ?? batch.map(\.length).max()!
+            var tokens = concatenated(batch.map { r -> MLXArray in
                 let t = r.tokenArray
                 return r.length == longest ? t : concatenated([t, MLXArray.zeros([1, longest - r.length], dtype: t.dtype)], axis: 1)
             }, axis: 0)
+            if options.fixedSequenceLength != nil, batch.count < walkRowCapacity {
+                tokens = concatenated([tokens, MLXArray.zeros([walkRowCapacity - batch.count, longest], dtype: tokens.dtype)], axis: 0)
+            }
             let h = try embedder(tokens)
             eval(h)
             for (j, r) in batch.enumerated() { try put("c", r.key, 0, h[j ..< j + 1, 0 ..< r.length]) }
@@ -874,14 +916,14 @@ public final class BlockPipeline {
         if plain.isEmpty && selRows.isEmpty { return }
         // Groups of rows of similar length, then walks of as many groups as fit the state budget. A walk costs one
         // read of every layer of the block, so the fewer walks the better; the budget only bounds the hidden states.
-        let groups = TeacherPrepass.batches(lengths: plain.map(\.length), maxTokens: options.maxBatchTokens, maxRows: options.maxBatchRows)
+        let groups = walkGroups(lengths: plain.map(\.length))
         let perToken = max(1, hiddenSize * 4)  // the compute dtype's widest; storage may be narrower
         var walks: [[[Int]]] = []
         var current: [[Int]] = []
         var currentBytes = selRows.reduce(0) { $0 + 2 * $1.length * perToken }
         for g in groups {
-            let longest = g.map { plain[$0].length }.max() ?? 0
-            let bytes = g.count * longest * perToken
+            let longest = options.fixedSequenceLength ?? (g.map { plain[$0].length }.max() ?? 0)
+            let bytes = (options.fixedSequenceLength != nil ? walkRowCapacity : g.count) * longest * perToken
             if !current.isEmpty && currentBytes + bytes > options.teacherStateBudgetBytes {
                 walks.append(current)
                 current = []
@@ -1086,7 +1128,7 @@ public final class BlockPipeline {
         let range = blockRanges(ends: blockEnds)[b]
         let sliced = source.canSliceLayers
         let todo = rows.filter { !has("d", $0.key, b + 1) || !has("c", $0.key, b + 1) }
-        let groups = TeacherPrepass.batches(lengths: todo.map(\.length), maxTokens: options.maxBatchTokens, maxRows: options.maxBatchRows)
+        let groups = walkGroups(lengths: todo.map(\.length))
         for g in groups {
             if callbacks.stopRequested() { throw StopWhileWritingFrontier() }
             let batch = g.map { todo[$0] }

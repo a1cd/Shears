@@ -78,8 +78,19 @@ final class BlockMemoryGrowthTests: ShearsTestCase {
         let blocks = try run(blocks: 6)
         Memory.clearCache()
         print("BLOCKGROWTH after run() returned: \(Memory.activeMemory >> 10) KB vs \(base >> 10) KB before")
+        // Nothing of the run is kept once it returns (the old cached checkpoint closure kept every block's layers alive:
+        // 75 MB after six tiny blocks).
+        XCTAssertLessThan(Memory.activeMemory - base, 8 << 20, "memory held after the run returned")
         for (b, x) in blocks.enumerated() {
             print("BLOCKGROWTH compile=\(compiled) block \(b + 1): active at first step \(x.activeAtFirstStep >> 10) KB, peak \(x.peak >> 10) KB, estimate \(x.estimate >> 10) KB, active at end \(x.activeAtEnd >> 10) KB")
+        }
+        // Every block has the same shape: what is held when it starts, its training peak and the planner's estimate stay put.
+        let mb = 1 << 20
+        for (b, x) in blocks.enumerated().dropFirst(2) {
+            XCTAssertLessThan(x.activeAtFirstStep - blocks[1].activeAtFirstStep, 8 * mb, "block \(b + 1) active at first step grew")
+            XCTAssertLessThan(x.activeAtEnd - blocks[1].activeAtEnd, 8 * mb, "block \(b + 1) active at end grew")
+            XCTAssertLessThan(x.peak - blocks[1].peak, 16 * mb, "block \(b + 1) training peak grew")
+            XCTAssertLessThan(x.estimate - blocks[1].estimate, 1 * mb, "block \(b + 1) estimate grew")
         }
     }
 }
