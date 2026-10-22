@@ -75,6 +75,58 @@ final class HealingExportTests: ShearsTestCase {
         XCTAssertNotNil(try? r.floats("blk.0.attn_norm.weight"))
     }
 
+    /// A Hugging Face cache snapshot holds its files as relative symlinks into `../../blobs/`.
+    /// The export must carry the files' contents, never the links: a copied relative link dangles
+    /// in the export directory.
+    func testExportCopiesTokenizerFilesFromSymlinkedSnapshot() throws {
+        let m = try HealingFixture.model()
+        let keep = HealingFixture.keepSets(count: 4)
+        let h = try HealingFixture.healer(model: m, keep: keep)
+        HealingFixture.randomizeAdapters(h.adapters, scale: 0.1)
+
+        let fm = FileManager.default
+        let cache = try tempDir("hfcache")
+        let blobs = cache.appendingPathComponent("blobs")
+        let snapshot = cache.appendingPathComponent("snapshots/abc123")
+        try fm.createDirectory(at: blobs, withIntermediateDirectories: true)
+        try fm.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        let tok = try tempDir("tok")
+        try GGUFTinyGemma4.writeTokenizer(to: tok)
+        try Data(#"{"do_sample": true, "top_k": 64}"#.utf8).write(to: tok.appendingPathComponent("generation_config.json"))
+        try Data(#"{"bos_token": "<bos>"}"#.utf8).write(to: tok.appendingPathComponent("special_tokens_map.json"))
+        let names = [
+            "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
+            "generation_config.json", "special_tokens_map.json",
+        ]
+        for (i, name) in names.enumerated() {
+            let blob = "blob\(i)deadbeef"
+            try fm.moveItem(at: tok.appendingPathComponent(name), to: blobs.appendingPathComponent(blob))
+            try fm.createSymbolicLink(
+                atPath: snapshot.appendingPathComponent(name).path, withDestinationPath: "../../blobs/\(blob)")
+        }
+        // The links in the source resolve, and are links.
+        for name in names {
+            XCTAssertNotNil(
+                try? fm.destinationOfSymbolicLink(atPath: snapshot.appendingPathComponent(name).path), name)
+        }
+
+        let dir = try tempDir()
+        var o = MergeAndSliceExport.Options()
+        o.dtype = .bfloat16
+        o.sourceDirectory = snapshot
+        try MergeAndSliceExport.write(model: m, keep: keep, adapters: h.adapters, to: dir, options: o)
+
+        for (i, name) in names.enumerated() {
+            let out = dir.appendingPathComponent(name)
+            let attrs = try fm.attributesOfItem(atPath: out.path)
+            XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeRegular, "\(name) must be a regular file, not a link")
+            XCTAssertNil(try? fm.destinationOfSymbolicLink(atPath: out.path), name)
+            XCTAssertEqual(
+                try Data(contentsOf: out), try Data(contentsOf: blobs.appendingPathComponent("blob\(i)deadbeef")),
+                "\(name) bytes")
+        }
+    }
+
     func testExportRefusesUnevenKeepCounts() throws {
         let m = try HealingFixture.model()
         let dir = try tempDir()
