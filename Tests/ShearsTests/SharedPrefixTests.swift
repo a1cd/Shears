@@ -346,7 +346,15 @@ final class SharedPrefixTests: ShearsTestCase {
             for (k, g) in fw {
                 XCTAssertTrue(isFinite(g).all().item(Bool.self), k)
                 if k.hasPrefix("layers.0."), k.hasSuffix("b"), abs(g).max().item(Float.self) > 1e-6 { reachedLayer0 = true }
-                assertClose(fs[k]!, g, atol: 2e-3, rtol: 2e-3, "grad \(k) \(label)")
+                // The gradients here are up to ~800 in size and pass through every layer, so float32 gives each
+                // tensor an error proportional to its largest element, not to each element. On the CPU backend
+                // (CI on Linux: AMD EPYC, 4 threads) that error is ~1e-5 of the tensor's max |g|: shared vs whole
+                // rows differ by 0.0074 on layers.0.attn_out.b (max |g| 829), and nudging the inputs by a relative
+                // 1e-6 moves the whole-row gradient by 0.038, five times more. So on the CPU the tolerance gets a
+                // term of 1e-4 of the tensor's max |g|; a wrong gradient is off by far more. Metal keeps the exact one.
+                let cpu = Device.defaultDevice().deviceType == .cpu
+                let noise: Float = cpu ? 1e-4 * abs(g).max().item(Float.self) : 0
+                assertClose(fs[k]!, g, atol: 2e-3 + noise, rtol: 2e-3, "grad \(k) \(label)")
             }
             // Layer 0's adapters sit below every shared K/V; with the gradient cut at layer 2 they get none.
             XCTAssertEqual(reachedLayer0, detach == nil, label)

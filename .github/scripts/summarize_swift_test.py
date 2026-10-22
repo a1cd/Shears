@@ -18,8 +18,6 @@ import sys
 KNOWN_FLAKES = {
     # adapters of the merged and routed layouts drift 7.4e-4 apart against atol 5e-4 / rtol 5e-3; losses agree
     "MergedExpertTests.testPipelineTrainingIsTheSameInMergedAndRoutedLayouts",
-    # layer-0 adapter gradient differs by 7e-3 between shared-prefix and whole-row passes against atol 2e-3 / rtol 2e-3
-    "SharedPrefixTests.testNetworkAdapterGradientsEqualWholeRows",
 }
 TOLERANCE_MESSAGE = "max |diff|"
 
