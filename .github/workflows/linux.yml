@@ -28,14 +28,38 @@ jobs:
 
       - uses: ./.github/actions/setup-linux
 
+      # CLI/.build (SwiftPM skips what is up to date, so only Shears itself is rebuilt) and ccache (the same compiles by
+      # content, if SwiftPM decides to redo them). Keyed on what the dependencies and the toolchain are, not on the commit:
+      # the cache is written once per key, by the first run that misses.
+      - name: Restore the SwiftPM build and the compiler cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            CLI/.build
+            ~/.cache/ccache
+          key: cpu-build-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift', 'Notebooks/mlx-swift-linux-cpu.patch', '.github/actions/setup-linux/action.yml') }}
+          restore-keys: cpu-build-${{ runner.arch }}-
+
       - name: swift build shears-cli
         working-directory: CLI
         run: |
           swift package resolve
-          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # a restored .build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           start=$(date +%s)
           swift build -c release --product shears-cli --static-swift-stdlib
           echo "release build: $(( $(date +%s) - start )) s"
+          ccache -s | grep -E 'Hits|Misses|Cache size'
+
+      - name: Save the SwiftPM build and the compiler cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            CLI/.build
+            ~/.cache/ccache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Bundle
         run: .github/scripts/package-linux.sh CLI/.build/release/shears-cli
@@ -83,16 +107,38 @@ jobs:
 
       - uses: ./.github/actions/setup-linux
 
+      - name: Restore the SwiftPM build and the compiler cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .build
+            ~/.cache/ccache
+          key: cpu-test-${{ runner.arch }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Notebooks/mlx-swift-linux-cpu.patch', '.github/actions/setup-linux/action.yml') }}
+          restore-keys: cpu-test-${{ runner.arch }}-
+
       - name: swift test
         run: |
           grep -m1 'model name' /proc/cpuinfo | tee -a "$GITHUB_STEP_SUMMARY"
           swift package resolve
-          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # a restored .build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           # The verdict step below decides; keep the exit status for it.
           set +e
           swift test 2>&1 | tee swift-test.log
           echo "${PIPESTATUS[0]}" > swift-test.status
+          ccache -s | grep -E 'Hits|Misses|Cache size'
           exit 0
+
+      # Saved before the verdict, so a run whose tests fail still leaves the cache behind (the build is what is in it).
+      - name: Save the SwiftPM build and the compiler cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .build
+            ~/.cache/ccache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       # Fails the job unless the only failures are the documented numeric-tolerance ones
       # (KNOWN_FLAKES in the script; see docs/linux.md). A crash or a build error always fails.
@@ -142,6 +188,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Cache pip downloads (jupyter, CPU torch)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-notebook-${{ runner.os }}-py3.12-v1
 
       - name: Python tools (like Colab, jupyter and CPU torch are preinstalled)
         run: |
