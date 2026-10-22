@@ -129,6 +129,50 @@ final class RunnerTests: ShearsTestCase {
         XCTAssertTrue(rewritten.contains("\"num_experts\": 8"), rewritten)
     }
 
+    /// `shears-cli export` of a multimodal source (a `text_config` and a `vision_config`, like every Gemma 4 download)
+    /// writes a text-only model by default, which transformers loads as `Gemma4ForCausalLM`; `export.textOnly: false`
+    /// keeps the multimodal layout. The config key is accepted by the schema check.
+    func testExportOfAMultimodalSourceIsTextOnlyUnlessAskedOtherwise() throws {
+        func exported(textOnly: Bool?) throws -> (config: [String: Any], keys: Set<String>) {
+            let dir = try tempDir("textonly-runner")
+            try SampleWorkspace.write(to: dir)
+            let source = dir.appendingPathComponent("model/config.json")
+            let flat = try JSONSerialization.jsonObject(with: Data(contentsOf: source)) as! [String: Any]
+            let multimodal: [String: Any] = [
+                "architectures": ["Gemma4ForConditionalGeneration"], "model_type": "gemma4", "eos_token_id": [1, 106],
+                "text_config": flat, "vision_config": ["model_type": "gemma4_vision"],
+            ]
+            try JSONSerialization.data(withJSONObject: multimodal).write(to: source)
+            var cfg = try JSONSerialization.jsonObject(with: Data(contentsOf: Self.sampleConfig)) as! [String: Any]
+            var export: [String: Any] = ["dtype": "float32", "adapters": "none"]
+            if let textOnly { export["textOnly"] = textOnly }
+            cfg["export"] = export
+            try JSONSerialization.data(withJSONObject: cfg).write(to: dir.appendingPathComponent("config.json"))
+            let config = try RunnerConfig.load(from: dir.appendingPathComponent("config.json"))
+            var env = RunEnvironment()
+            env.log = { _ in }
+            for command in [ShearsCommand.select, .export] {
+                XCTAssertEqual(try ShearsRunner.execute(command, config: config, environment: env), .finished, "\(command)")
+            }
+            let out = dir.appendingPathComponent("out/export")
+            let json = try JSONSerialization.jsonObject(with: Data(contentsOf: out.appendingPathComponent("config.json"))) as! [String: Any]
+            let index = try JSONSerialization.jsonObject(with: Data(contentsOf: out.appendingPathComponent("model.safetensors.index.json"))) as! [String: Any]
+            return (json, Set((index["weight_map"] as! [String: String]).keys))
+        }
+        for textOnly in [nil, true] as [Bool?] {
+            let e = try exported(textOnly: textOnly)
+            XCTAssertNil(e.config["text_config"], "textOnly \(String(describing: textOnly))")
+            XCTAssertNil(e.config["vision_config"])
+            XCTAssertEqual(e.config["architectures"] as? [String], ["Gemma4ForCausalLM"])
+            XCTAssertFalse(e.keys.contains { $0.contains("language_model") })
+            XCTAssertTrue(e.keys.contains("model.embed_tokens.weight"))
+        }
+        let multimodal = try exported(textOnly: false)
+        XCTAssertNotNil(multimodal.config["text_config"])
+        XCTAssertNotNil(multimodal.config["vision_config"])
+        XCTAssertTrue(multimodal.keys.contains("model.language_model.embed_tokens.weight"))
+    }
+
     func testSampleConfigRunsEveryCommandEndToEnd() throws {
         let dir = try workspace()
         let cfg = try config(dir)

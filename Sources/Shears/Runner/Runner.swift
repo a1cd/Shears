@@ -584,6 +584,7 @@ final class Run {
         var o = MergeAndSliceExport.Options()
         o.dtype = dtype
         if let x = c.export?.layersPerShard { o.layersPerShard = x }
+        o.textOnly = c.export?.textOnly ?? true
         o.sourceDirectory = c.resolve(c.model)
         o.log = { self.log("export: \($0)") }
         let target = exportDirectory

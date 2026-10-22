@@ -26,9 +26,18 @@ public enum MergeAndSliceExport {
         /// (kept-expert) layers at a time.
         public var layersPerShard = 1
         /// The tensor name prefix. `nil` follows the config that is written: `model.language_model.` when the
-        /// source `config.json` is multimodal (has a `text_config`, as `google/gemma-4-26B-A4B-it` does), and
-        /// `model.` for a text-only config, which is what transformers' `Gemma4ForCausalLM` expects.
+        /// config is multimodal (the source `config.json` has a `text_config`, as `google/gemma-4-26B-A4B-it` does
+        /// and ``textOnly`` is off), and `model.` for a text-only config, which is what transformers'
+        /// `Gemma4ForCausalLM` expects.
         public var prefix: String?
+        /// Write a text-only model when the source `config.json` is multimodal: a flat `gemma4_text` config
+        /// (`architectures: ["Gemma4ForCausalLM"]`, no `vision_config`) and `model.` tensor names. transformers then
+        /// loads the export as `Gemma4ForCausalLM`. The multimodal layout (`false`) makes it build
+        /// `Gemma4ForConditionalGeneration`, whose vision tower has no weights in the export and is initialized at
+        /// random: about 0.6 billion parameters of noise that no text prompt touches, and a load report full of
+        /// MISSING keys. Shears' own readers (checkpoint, inference, GGUF) take either layout. A source whose config
+        /// is already flat is unaffected.
+        public var textOnly = false
         /// A directory whose `config.json` and tokenizer files are carried over.
         public var sourceDirectory: URL?
         /// Progress lines: one per merged layer, with the MLX memory peak so far.
@@ -172,7 +181,7 @@ public enum MergeAndSliceExport {
             throw HealingError.invalid(
                 "the model was healed against weights exported as \(qat.exportDType) but this export writes \(options.dtype)")
         }
-        let p = options.prefix ?? layoutPrefix(options.sourceDirectory)
+        let p = options.prefix ?? layoutPrefix(options.sourceDirectory, textOnly: options.textOnly)
         var weightMap: [String: String] = [:]
         var bytes = 0
         func flush(_ name: String, _ tensors: [String: MLXArray]) throws {
@@ -257,14 +266,34 @@ public enum MergeAndSliceExport {
             options: options)
     }
 
-    /// `model.language_model.` for a multimodal source config, `model.` for a text-only or absent one.
-    static func layoutPrefix(_ sourceDirectory: URL?) -> String {
-        guard let src = sourceDirectory,
+    /// `model.language_model.` for a multimodal source config (unless the export is ``Options/textOnly``),
+    /// `model.` for a text-only or absent one.
+    static func layoutPrefix(_ sourceDirectory: URL?, textOnly: Bool = false) -> String {
+        guard !textOnly, let src = sourceDirectory,
             let data = try? Data(contentsOf: src.appendingPathComponent("config.json")),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             json["text_config"] != nil
         else { return "model." }
         return "model.language_model."
+    }
+
+    /// The flat config transformers loads as `Gemma4ForCausalLM`: the multimodal config's `text_config` lifted to the
+    /// top, plus the root's settings that still mean something without a vision tower. The vision and audio configs
+    /// are dropped. The root's `eos_token_id` (the list that includes the end-of-turn token) wins over the text
+    /// config's single one, and the root's `*_token_id` / `*_token_index` entries stay, because the GGUF converter
+    /// reads the special-token ids from the config.
+    static func textOnlyConfig(root: [String: Any], text: [String: Any]) -> [String: Any] {
+        var flat = text
+        flat["architectures"] = ["Gemma4ForCausalLM"]
+        flat["model_type"] = flat["model_type"] ?? "gemma4_text"
+        for (k, v) in root where k != "text_config" && k != "vision_config" && k != "audio_config" {
+            if k == "eos_token_id" || k == "dtype" || k == "transformers_version" || k == "tie_word_embeddings"
+                || ((k.hasSuffix("_token_id") || k.hasSuffix("_token_index")) && flat[k] == nil)
+            {
+                if !(v is NSNull) { flat[k] = v }
+            }
+        }
+        return flat
     }
 
     private static func writeConfiguration(
@@ -285,6 +314,7 @@ public enum MergeAndSliceExport {
             if var text = root["text_config"] as? [String: Any] {
                 patch(&text)
                 root["text_config"] = text
+                if options.textOnly { root = textOnlyConfig(root: root, text: text) }
             } else {
                 patch(&root)
             }

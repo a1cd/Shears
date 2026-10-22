@@ -236,11 +236,19 @@ public struct RunnerConfig: Decodable {
         public var adapters: String?
         public var dtype: String?
         public var layersPerShard: Int?
-        public init(directory: String? = nil, adapters: String? = nil, dtype: String? = nil, layersPerShard: Int? = nil) {
+        /// A multimodal source (a `text_config` in its `config.json`) is exported as a text-only model: a flat config
+        /// and `model.` tensor names, which transformers loads as `Gemma4ForCausalLM`. Default `true`; `false` keeps
+        /// the multimodal layout (`Gemma4ForConditionalGeneration` with a vision tower the export has no weights for).
+        public var textOnly: Bool?
+        public init(
+            directory: String? = nil, adapters: String? = nil, dtype: String? = nil, layersPerShard: Int? = nil,
+            textOnly: Bool? = nil
+        ) {
             self.directory = directory
             self.adapters = adapters
             self.dtype = dtype
             self.layersPerShard = layersPerShard
+            self.textOnly = textOnly
         }
     }
     public struct GGUF: Decodable {
@@ -323,7 +331,7 @@ enum Schema {
         ]),
         "prepass": leaves(["storageDType", "maxBatchTokens", "maxBatchRows"]),
         "stages": .array(stage),
-        "export": leaves(["directory", "adapters", "dtype", "layersPerShard"]),
+        "export": leaves(["directory", "adapters", "dtype", "layersPerShard", "textOnly"]),
         "gguf": leaves(["type", "output", "input"]),
     ])
 
