@@ -1,0 +1,114 @@
+name: CI bench (temporary, ci/fast-builds only)
+
+# Measurements for the CI-speed work; deleted before the PR. A commit message containing [cpu], [nvcc] or [cuda] picks the jobs.
+on:
+  push:
+    branches: [ci/fast-builds]
+    paths:
+      - ".github/workflows/ci-bench.yml"
+      - ".github/scripts/**"
+      - ".github/actions/**"
+
+concurrency:
+  group: ci-bench-${{ github.sha }}
+
+permissions:
+  contents: read
+
+env:
+  CUDA_PACKAGE_VERSION: "13-0"
+  CUDNN_VERSION: "9.14.0.64-1"
+  SHEARS_CUDA_ARCHS: "75 80 90"
+  CUTLASS_TAG: v4.4.2
+  CUDNN_FRONTEND_TAG: v1.16.0
+  CCCL_TAG: v3.1.3
+
+jobs:
+  # Does a restored SwiftPM build directory skip work, and does ccache in front of the toolchain's clang?
+  cpu-probe:
+    if: contains(github.event.head_commit.message, '[cpu]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      SPM_CUDA: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux
+      - name: probe
+        working-directory: CLI
+        run: |
+          set +e
+          export CCACHE_LOGFILE="$RUNNER_TEMP/ccache.log"
+          nproc; free -m | head -2; df -h / | tail -1
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          build() {   # $1 = label
+            local s=$(date +%s)
+            swift build -c release --product shears-cli --static-swift-stdlib > "$RUNNER_TEMP/$1.log" 2>&1; local rc=$?
+            echo "== $1: exit $rc, $(( $(date +%s) - s )) s, $(grep -c '\] Compiling ' "$RUNNER_TEMP/$1.log") Compiling lines"
+            grep -E '^\[[0-9]+/[0-9]+\] (Compiling|Linking)' "$RUNNER_TEMP/$1.log" | sed -E 's/^\[[0-9]+\/[0-9]+\] //' | awk '{print $1, $2}' | sort | uniq -c | sort -rn | head -5
+            tail -3 "$RUNNER_TEMP/$1.log"
+          }
+          ccache -z
+          build 1-cold
+          ccache -s
+          build 2-noop-same-dir
+          # what actions/cache does: the directory comes back with the same mtimes and new inodes
+          cp -a .build .build.copy && rm -rf .build && mv .build.copy .build
+          CCACHE_DISABLE=1 build 3-restored-dir-no-ccache
+          rm -rf .build
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          ccache -z
+          build 4-fresh-dir-warm-ccache
+          ccache -s -v
+          du -sh "$HOME/.cache/ccache" .build
+          tar -C "$HOME/.cache" --zstd -cf "$RUNNER_TEMP/ccache.tzst" ccache && ls -l "$RUNNER_TEMP/ccache.tzst"
+          echo "ccache log results:"; grep -o 'Result: [a-z_]*' "$RUNNER_TEMP/ccache.log" | sort | uniq -c
+          grep -E 'Failed|nsupported|not supported|Disabled|Compiler' "$RUNNER_TEMP/ccache.log" | sed -E 's/^\[[^]]*\] //' | sort | uniq -c | sort -rn | head -15
+
+  # How long each .cu file takes, how much memory nvcc takes, and what parallelism buys, on the runner's 4 cores.
+  nvcc-matrix:
+    if: contains(github.event.head_commit.message, '[nvcc]')
+    name: nvcc ${{ matrix.cfg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg: ["3 1", "4 1", "2 2", "3 3"]   # concurrent files, nvcc --threads
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux
+      - uses: ./.github/actions/setup-cuda
+      - name: transpile every .cu as encuda does
+        run: |
+          read P T <<< "${{ matrix.cfg }}"
+          export SHEARS_NVCC_LOG="$RUNNER_TEMP/nvcc.log" SHEARS_NVCC_THREADS=$T CCACHE_DISABLE=1
+          unset SHEARS_NVCC_CACHE
+          export PATH="$HOME/nvcc-wrapper:/usr/local/cuda/bin:$PATH"
+          nproc; free -m | head -2
+          src="$HOME/mlx-swift/Source/Cmlx"
+          export src CLANGPP=$(ls -d "$HOME"/.local/share/swiftly/toolchains/*/usr/bin/clang++ | head -1)
+          mkdir -p "$RUNNER_TEMP/out"; export OUT="$RUNNER_TEMP/out"
+          find "$src" -name '*.cu' | sort > "$RUNNER_TEMP/list.txt"
+          echo "$(wc -l < "$RUNNER_TEMP/list.txt") .cu files; P=$P threads=$T"
+          cat > "$RUNNER_TEMP/one.sh" <<'SH'
+          f="$1"
+          nvcc -cuda -rdc=true --expt-relaxed-constexpr -std=c++20 -ccbin="$CLANGPP" -arch sm_75 \
+            -I "$src" -I "$src/mlx" -I "$src/mlx-c" -I "$src/json/single_include/nlohmann" -I "$src/fmt/include" \
+            "$f" -o "$OUT/$(echo "${f#"$src"/}" | tr / _).cpp" > /dev/null 2>"$OUT/err.$$" || { echo "FAILED $f"; tail -5 "$OUT/err.$$"; }
+          SH
+          ( while sleep 5; do awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo; done > "$RUNNER_TEMP/mem.txt" ) &
+          start=$(date +%s)
+          xargs -P "$P" -n 1 bash "$RUNNER_TEMP/one.sh" < "$RUNNER_TEMP/list.txt"
+          total=$(( $(date +%s) - start ))
+          echo "TOTAL P=$P threads=$T: $total s"
+          echo "min MemAvailable MB: $(sort -n "$RUNNER_TEMP/mem.txt" | head -1)"
+          echo "calls: $(wc -l < "$RUNNER_TEMP/nvcc.log"); sum of call seconds: $(awk -F'\t' '{s+=$3} END{print s}' "$RUNNER_TEMP/nvcc.log")"
+          echo "peak RSS of one nvcc (KB), max: $(awk -F'\t' '{print $5}' "$RUNNER_TEMP/nvcc.log" | sort -n | tail -1)"
+          echo "slowest:"; sort -t$'\t' -k3 -nr "$RUNNER_TEMP/nvcc.log" | head -12
+          echo "fastest:"; sort -t$'\t' -k3 -n "$RUNNER_TEMP/nvcc.log" | head -3
+          echo "size of outputs: $(du -sh "$OUT" | cut -f1)"
+          cp "$RUNNER_TEMP/nvcc.log" "$RUNNER_TEMP/nvcc-$P-$T.log"
+          { echo "### nvcc P=$P threads=$T: $total s"; echo '```'; sort -t$'\t' -k3 -nr "$RUNNER_TEMP/nvcc.log" | head -12; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

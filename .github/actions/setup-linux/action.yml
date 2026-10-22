@@ -2,8 +2,8 @@ name: Linux Swift and patched mlx-swift
 description: >
   Installs the system packages and Swift 6.3.3 (swiftly), and prepares $HOME/mlx-swift (the
   version Shears is pinned to, with Notebooks/mlx-swift-linux-cpu.patch applied and
-  compiled_preamble.cpp regenerated for this CPU). Same steps as the Linux cells of
-  Notebooks/Shears.ipynb and docs/linux.md.
+  compiled_preamble.cpp regenerated for this CPU), and puts ccache in front of the toolchain's clang (the caller
+  restores and saves $HOME/.cache/ccache). Same steps as the Linux cells of Notebooks/Shears.ipynb and docs/linux.md.
 inputs:
   swift-version:
     description: Swift toolchain version
@@ -17,7 +17,7 @@ runs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq build-essential git curl ca-certificates python3 pkg-config binutils gnupg2 unzip tzdata \
           zlib1g-dev libncurses-dev libedit2 libsqlite3-0 libcurl4-openssl-dev libxml2-dev libz3-dev \
-          libopenblas-dev liblapacke-dev gfortran ninja-build libstdc++-13-dev libgcc-13-dev patchelf
+          libopenblas-dev liblapacke-dev gfortran ninja-build libstdc++-13-dev libgcc-13-dev patchelf ccache
         g++ --version | head -1
 
     - name: Cache the Swift toolchain
@@ -49,6 +49,23 @@ runs:
         echo "swift in use: $(command -v swift)"
         swift --version
         swift --version 2>&1 | grep -q "Swift version $SWIFT_VERSION"
+
+    - name: ccache in front of the toolchain's clang
+      shell: bash
+      env:
+        SWIFT_VERSION: ${{ inputs.swift-version }}
+      run: |
+        # Every C/C++/assembly compile SwiftPM runs (MLX, BoringSSL from swift-crypto, and with CUDA the generated .cpp files
+        # and encuda's host compiler) goes through ccache. The cache directory is restored and saved by the workflow.
+        "$GITHUB_WORKSPACE/.github/scripts/ccache-toolchain.sh" "$HOME/.local/share/swiftly/toolchains/$SWIFT_VERSION/usr/bin"
+        {
+          echo "CCACHE_DIR=$HOME/.cache/ccache"
+          echo "CCACHE_MAXSIZE=6G"
+          echo "CCACHE_COMPILERCHECK=string:swift-$SWIFT_VERSION-clang"
+          echo "CCACHE_SLOPPINESS=include_file_mtime,include_file_ctime,time_macros,modules"
+        } >> "$GITHUB_ENV"
+        mkdir -p "$HOME/.cache/ccache"
+        ccache --version | head -1
 
     - name: Read the pinned mlx-swift version
       id: mlx
