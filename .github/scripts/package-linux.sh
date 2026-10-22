@@ -47,7 +47,7 @@ echo "ldd of the bundle (no LD_LIBRARY_PATH):"
 env -u LD_LIBRARY_PATH ldd "$PKG/bin/shears-cli" | tee "$DIST/ldd.txt"
 if grep -q "not found" "$DIST/ldd.txt"; then echo "unresolved libraries"; exit 1; fi
 if env -u LD_LIBRARY_PATH ldd "$PKG/bin/shears-cli" | awk '/=> \//{print $1, $3}' \
-    | while read -r so path; do [[ "$so" =~ $SYSTEM ]] || [[ "$path" == "$PKG/lib/"* ]] || echo "$so resolves outside the bundle: $path"; done | grep .; then
+    | while read -r so path; do [[ "$so" =~ $SYSTEM ]] || [[ "$path" == "$PKG/bin/../lib/"* ]] || echo "$so resolves outside the bundle: $path"; done | grep .; then
   exit 1
 fi
 env -u LD_LIBRARY_PATH "$PKG/bin/shears-cli" --help >/dev/null

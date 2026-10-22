@@ -165,10 +165,9 @@ jobs:
 
       - name: Run the notebook headless
         env:
-          # Point the notebook's prebuilt path at the artifact instead of the release URL, and do not
-          # let it fall back to a source build (a green run must mean the prebuilt path worked).
+          # Point the notebook's download at the artifact instead of the release URL. The notebook has
+          # no source-build fallback, so a green run means the prebuilt path worked.
           SHEARS_PREBUILT_URL: file://${{ github.workspace }}/artifact/shears-cli-linux-x86_64.tar.gz
-          SHEARS_PREBUILT_REQUIRED: "1"
           SHEARS_WORK: ${{ runner.temp }}/shears-work
         run: |
           mkdir -p "$RUNNER_TEMP/out"
