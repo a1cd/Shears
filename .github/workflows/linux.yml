@@ -4,7 +4,7 @@ name: Linux
 # headless against the prebuilt binary on a runner with no Swift. See docs/linux.md.
 on:
   push:
-    branches: [prebuilt-binary, main, ci/fast-builds]   # ci/fast-builds: temporary
+    branches: [prebuilt-binary, main]
   pull_request:
   workflow_dispatch:
 

@@ -81,13 +81,41 @@ jobs:
           key: cuda-build-${{ steps.cuda.outputs.salt }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift') }}
           restore-keys: cuda-build-${{ steps.cuda.outputs.salt }}-
 
+      # The compiler caches alone, written by runs that did not save the entry above (the build failed or was cancelled
+      # after compiling something). A different path list is a different cache, so this never shadows the entry above; its
+      # key is unique per run and the newest one under the prefix is restored, on top of the entry above. Not needed when
+      # the entry above matched exactly: that run's compilers are already in it.
+      - name: Restore the compiler caches kept by earlier failed or cancelled runs
+        id: compilers
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: cuda-compilers-${{ steps.cuda.outputs.salt }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cuda-compilers-${{ steps.cuda.outputs.salt }}-
+
       # nvcc --threads 3 compiles the architectures of one file in parallel: 1171 s instead of 2147 s for the 98 .cu files
       # (measured on this runner, nvcc alone, 3 files at once). It also took the runner down to 357 MB of free RAM, which is
       # why there is swap: running out of memory then slows the build instead of killing it.
+      # The image already has a 3 GB /swapfile that is in use, and `fallocate -l 12G /swapfile` on it fails with "Text file
+      # busy". The first version chained the commands with && under `bash -e`, which does not stop on a failure inside a
+      # chain, so the step went green having done nothing (run 39835532753). Own file, one command per line, and the step
+      # fails unless the swap is really there.
       - name: Swap file (headroom for nvcc --threads)
         run: |
-          sudo fallocate -l 12G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
+          set -euo pipefail
+          f=/mnt/shears.swap; [ -d /mnt ] || f=/shears.swap
+          df -h "$(dirname "$f")" | tail -1
+          sudo fallocate -l 12G "$f"
+          sudo chmod 600 "$f"
+          sudo mkswap "$f"
+          sudo swapon "$f"
           free -m
+          swapon --show
+          total=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "$total" -lt 12000 ]; then echo "::error::swap is $total MB, expected at least 12000 (the swap file was not enabled)"; exit 1; fi
           # redirected completely, or the step would wait for the background loop's stderr pipe
           ( while sleep 10; do free -m | awk '/Mem:/{a=$7} /Swap:/{u=$3} END{print a, u}'; done ) > "$RUNNER_TEMP/mem.txt" 2>&1 < /dev/null &
 
@@ -106,6 +134,7 @@ jobs:
           # a restored CLI/.build already records the edit
           out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           start=$(date +%s)
+          ccache -z   # the statistics live in the restored directory: zero them, so the report below counts this run only
           # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
           # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
           export SHEARS_NVCC_LOG="$RUNNER_TEMP/nvcc.log"
@@ -114,6 +143,7 @@ jobs:
 
       # Saved right after the build, so a later failing check does not lose it. Only a miss writes (entries are immutable).
       - name: Save the CUDA build and compiler caches
+        id: save-build
         if: always() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -123,14 +153,38 @@ jobs:
             ~/.cache/shears-nvcc
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+      # The compilers' work is worth keeping even when the build does not finish: a cold build is the expensive hour, and a
+      # failure at minute 50 (or a cancel from a newer push) must not throw it away. Saved separately from CLI/.build (a
+      # half-built directory is not worth restoring, the compiler caches are) and only if there is something new in them,
+      # and not when the step above just saved them inside the full entry.
+      - name: Did the compilers do new work?
+        id: fresh
+        if: always() && steps.save-build.outcome != 'success'
+        run: |
+          find "$HOME/.cache/shears-nvcc" -name '.tmp.*' -delete 2>/dev/null || true   # a call killed in the middle of its copy
+          n=$(awk -F'\t' '$4=="miss"' "$RUNNER_TEMP/nvcc.log" 2>/dev/null | wc -l)
+          c=$(ccache --print-stats 2>/dev/null | awk -F'\t' '$1=="cache_miss"{print $2}')
+          echo "nvcc misses: $n, ccache misses: ${c:-unknown}"
+          if [ "$n" -gt 0 ] || [ "${c:-0}" -gt 0 ]; then echo "work=true" >> "$GITHUB_OUTPUT"; else echo "work=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save the compiler caches (build failed or cancelled, or only they changed)
+        if: always() && steps.fresh.outputs.work == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: cuda-compilers-${{ steps.cuda.outputs.salt }}-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: Cache report
         if: always()
         continue-on-error: true
         run: |
           {
-            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }})"
+            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }}; exact hit: ${{ steps.cache.outputs.cache-hit || 'false' }}; compiler caches of earlier failed runs: ${{ steps.compilers.outputs.cache-matched-key || 'none' }})"
             echo '```'
             echo "release build: ${{ steps.build.outcome }}"
+            echo "nvcc wrapper: $(awk -F'\t' '$4=="hit"' "$RUNNER_TEMP/nvcc.log" | wc -l) hits, $(awk -F'\t' '$4=="miss"' "$RUNNER_TEMP/nvcc.log" | wc -l) misses"
             awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
             ccache -s | grep -E 'Hits|Misses|Cache size'
             echo "lowest available RAM MB: $(awk '{print $1}' "$RUNNER_TEMP/mem.txt" | sort -n | head -1); most swap used MB: $(awk '{print $2}' "$RUNNER_TEMP/mem.txt" | sort -n | tail -1)"
