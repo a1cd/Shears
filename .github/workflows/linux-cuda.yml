@@ -155,7 +155,7 @@ jobs:
           start=$(date +%s)
           # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
           # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
-          swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -lcufft
+          swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcufft
           echo "release build: $(( $(date +%s) - start )) s"
 
       - name: Bundle (NVIDIA libraries are not bundled)
