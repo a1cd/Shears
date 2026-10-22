@@ -45,7 +45,8 @@ jobs:
         working-directory: CLI
         run: |
           swift package resolve
-          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # a restored .build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           start=$(date +%s)
           swift build -c release --product shears-cli --static-swift-stdlib
           echo "release build: $(( $(date +%s) - start )) s"
@@ -120,7 +121,8 @@ jobs:
         run: |
           grep -m1 'model name' /proc/cpuinfo | tee -a "$GITHUB_STEP_SUMMARY"
           swift package resolve
-          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # a restored .build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           # The verdict step below decides; keep the exit status for it.
           set +e
           swift test 2>&1 | tee swift-test.log
