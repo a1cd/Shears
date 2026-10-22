@@ -99,7 +99,7 @@ jobs:
           # licenses of the open-source headers that go into the tarball (MLX's run-time kernel compiler needs them)
           mkdir -p "$T/licenses"
           cp "$T/cutlass/LICENSE.txt" "$T/licenses/CUTLASS-LICENSE.txt"
-          cp "$(ls -d "$T"/cccl/*/LICENSE.txt "$T"/cccl/LICENSE.txt 2>/dev/null | head -1)" "$T/licenses/CCCL-LICENSE.txt"
+          curl -fsSL -o "$T/licenses/CCCL-LICENSE.txt" "https://raw.githubusercontent.com/NVIDIA/cccl/$CCCL_TAG/LICENSE"
           echo "SHEARS_EXTRA_LICENSES=$T/licenses" >> "$GITHUB_ENV"
           sudo mkdir -p "$INC/cccl"
           sudo cp -r "$CCCL_INC"/. "$INC/cccl/"
