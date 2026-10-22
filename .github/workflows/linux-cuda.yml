@@ -64,18 +64,24 @@ jobs:
       - uses: ./.github/actions/setup-cuda
         id: cuda
 
-      # What does not change when only Shears does: MLX's CUDA backend. Two content-addressed caches, so nothing depends on
-      # file times or inodes: the nvcc wrapper's (one .cpp per .cu, plus the device link) and ccache's (every clang compile
-      # SwiftPM runs, including the generated .cpp files). The key is everything they depend on (the salt, see setup-cuda),
-      # not the commit, so it is written once per toolchain/MLX/architecture combination.
-      - name: Restore the CUDA compiler caches
+      # What does not change when only Shears does: MLX's CUDA backend. Cached as the SwiftPM build directory (SwiftPM then
+      # skips every nvcc and clang job whose inputs are unchanged, so only Shears is compiled and linked), plus, underneath
+      # it, two content-addressed caches that do not depend on file times: the nvcc wrapper's (one .cpp per .cu) and ccache's
+      # (every clang compile). If SwiftPM decides to redo work anyway, those make it cost minutes instead of an hour. The key
+      # is what the build depends on (the salt: toolkit, headers, host compiler, MLX, architectures; see setup-cuda) and the
+      # package manifests, not the commit, so one entry is written per combination, by the first run that misses.
+      - name: Restore the CUDA build and compiler caches
         id: cache
         uses: actions/cache/restore@v4
         with:
           path: |
+            CLI/.build
             ~/.cache/ccache
             ~/.cache/shears-nvcc
-          key: cuda-compilers-${{ steps.cuda.outputs.salt }}
+          key: cuda-build-${{ steps.cuda.outputs.salt }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift') }}
+          restore-keys: |
+            cuda-build-${{ steps.cuda.outputs.salt }}-
+            cuda-compilers-${{ steps.cuda.outputs.salt }}
 
       - name: swift build shears-cli (CUDA)
         working-directory: CLI
@@ -87,7 +93,8 @@ jobs:
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           command -v nvcc
           swift package resolve
-          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          # a restored CLI/.build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
           start=$(date +%s)
           # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
           # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
@@ -95,21 +102,22 @@ jobs:
           swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcufft
           echo "release build: $(( $(date +%s) - start )) s"
           {
-            echo "### CUDA compiler caches (key cuda-compilers-${{ steps.cuda.outputs.salt }}, restored: ${{ steps.cache.outputs.cache-hit == 'true' && 'yes' || 'no' }})"
+            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }})"
             echo '```'
             echo "release build: $(( $(date +%s) - start )) s"
             awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
             ccache -s | grep -E 'Hits|Misses|Cache size'
-            du -sh "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
+            du -sh CLI/.build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Saved right after the build, so a later failing check does not lose it. Only a miss writes (entries are immutable).
-      - name: Save the CUDA compiler caches
+      - name: Save the CUDA build and compiler caches
         if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
+            CLI/.build
             ~/.cache/ccache
             ~/.cache/shears-nvcc
           key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -79,6 +79,15 @@ runs:
         fi
         sudo cp gen/cuda_jit_sources.h /usr/local/cuda/include/
 
+    - name: Pin the times of the headers this action installed
+      shell: bash
+      run: |
+        # SwiftPM's build database (restored with CLI/.build) records the time of every header a compile read. These were
+        # just copied in, so their times are new on every run and every file that reads one would be rebuilt. Give the files
+        # written in the last hour (the headers above; the apt packages are older) one fixed time, the same on every run.
+        sudo find /usr/local/cuda/include -type f -newermt '2 hours ago' -exec touch -h -d '2020-01-01 00:00:00 UTC' {} +
+        echo "files in /usr/local/cuda/include newer than the pin: $(find /usr/local/cuda/include -type f -newermt '2020-01-02' | wc -l) (the toolkit's own, from the packages)"
+
     - name: nvcc wrapper (one architecture list for the compile and the device-link step; per-file cache; timing)
       shell: bash
       run: |
