@@ -1,0 +1,47 @@
+{
+  "model": "model",
+  "dtype": "float32",
+  "rows": "rows.jsonl",
+  "keep": "out/keep.json",
+  "order": { "kind": "shuffled", "seed": 9 },
+  "store": "store",
+  "checkpointDir": "checkpoints",
+  "outputDir": "out",
+  "stopFile": "STOP",
+  "seed": 1,
+  "progressEvery": 2,
+  "memory": { "memoryLimitGB": 3, "cacheLimitGB": 0.25 },
+  "adapters": { "expertRank": 8, "denseRank": 8, "routerRank": 4 },
+  "select": { "keep": 4, "importanceTokens": 40, "poolSize": 8, "poolByMass": 4, "poolByImportance": 4, "swapRounds": 1, "timeLimitPerLayer": 0 },
+  "prepass": { "maxBatchTokens": 64, "maxBatchRows": 2 },
+  "pipeline": { "steps": 4, "batchSteps": 2, "mix": "both", "rowsPerStep": 1, "sharedPrefix": "auto", "learningRate": 0.005, "learningRateFloor": 0.0005, "warmup": 1, "checkpointEvery": 2, "maxBatchTokens": 64, "maxBatchRows": 2 },
+  "sweep": {
+    "learningRates": [0.001, 0.01], "steps": [2, 4], "output": "out/sweep.json",
+    "variants": [
+      { "name": "base" },
+      { "name": "rows2", "rowsPerStep": 2 },
+      { "name": "plateau", "plateau": { "evalEvery": 1, "patience": 1, "threshold": 0.5, "annealSteps": 1 } },
+      { "name": "bf16", "dtype": "bfloat16" }
+    ]
+  },
+  "stages": [
+    {
+      "name": "A", "mode": "block", "steps": 6,
+      "learningRate": 0.005, "learningRateFloor": 0.0005, "warmup": 2,
+      "scheduleLength": 12, "checkpointEvery": 2
+    },
+    {
+      "name": "B", "mode": "block", "steps": 6, "initialAdapters": "previous",
+      "learningRate": 0.002, "learningRateFloor": 0.0002, "warmup": 2,
+      "scheduleLength": 6, "scheduleLengthChanges": [{ "from": 3, "total": 9 }],
+      "rowOffset": 2, "checkpointEvery": 2
+    },
+    {
+      "name": "C", "mode": "plan", "plan": "freerun@0,end@3", "steps": 5, "initialAdapters": "previous",
+      "learningRate": 0.001, "learningRateFloor": 0.0001, "warmup": 1, "endSamplePositions": 3,
+      "checkpointEvery": 2
+    }
+  ],
+  "export": { "dtype": "bfloat16" },
+  "gguf": { "type": "bf16", "output": "out/model.gguf" }
+}
