@@ -67,7 +67,7 @@ jobs:
             cuda-nvcc-$CUDA_PACKAGE_VERSION cuda-cudart-dev-$CUDA_PACKAGE_VERSION cuda-nvrtc-dev-$CUDA_PACKAGE_VERSION \
             cuda-driver-dev-$CUDA_PACKAGE_VERSION libcublas-dev-$CUDA_PACKAGE_VERSION cuda-cccl-$CUDA_PACKAGE_VERSION \
             cuda-cuobjdump-$CUDA_PACKAGE_VERSION cuda-nvdisasm-$CUDA_PACKAGE_VERSION \
-            cuda-nvtx-$CUDA_PACKAGE_VERSION
+            cuda-nvtx-$CUDA_PACKAGE_VERSION libcufft-dev-$CUDA_PACKAGE_VERSION
           if ! sudo apt-get install -y -qq --no-install-recommends \
                libcudnn9-dev-cuda-13=$CUDNN_VERSION libcudnn9-cuda-13=$CUDNN_VERSION libcudnn9-headers-cuda-13=$CUDNN_VERSION; then
             echo "::warning::cuDNN $CUDNN_VERSION is not in the repository any more; installing the newest"
@@ -154,7 +154,8 @@ jobs:
           swift package edit mlx-swift --path "$HOME/mlx-swift"
           start=$(date +%s)
           # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
-          swift build -c release --product shears-cli --static-swift-stdlib --jobs 3
+          # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
+          swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -lcufft
           echo "release build: $(( $(date +%s) - start )) s"
 
       - name: Bundle (NVIDIA libraries are not bundled)
