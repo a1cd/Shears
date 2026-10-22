@@ -171,13 +171,13 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------------------------
-  # Publishing: runs on pushes to main. (Was disabled until approved; the comment below is historical.)
-  # condition in the comment on the `if` line. It creates the release `linux-x86_64-latest` once and
-  # then replaces its two assets on every later run. It is the only job with write access.
+  # Publishing: runs on pushes to main, after build, test and the notebook pass. It creates the release
+  # `linux-x86_64-latest` once and then replaces its two assets on every later run. It is the only job
+  # with write access.
   publish:
     name: Publish the prebuilt tarball
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    needs: [build, notebook]   # TEMPORARY (2026-10-22): test does not gate publishing until the Linux CPU gradient test is fixed; restore `test` here then
+    needs: [build, test, notebook]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
