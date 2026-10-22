@@ -43,6 +43,25 @@ extension Run {
         return s
     }
 
+    /// `pipeline.sequenceLength`: a token count; `auto` (the longest row, rounded up to a multiple of 64); `buckets` (the
+    /// default off Linux: the fine ``StreamedBlockHealer/sequenceBuckets``). On Linux with a GPU the default is `auto`:
+    /// MLX's CUDA backend compiles kernels at run time, so one shape per function compiles each once.
+    func fixedSequenceLength(_ setting: String?, records: [RowRecord]) throws -> Int? {
+        var choice = setting
+        #if os(Linux)
+        if choice == nil, Device.defaultDevice().deviceType == .gpu { choice = "auto" }
+        #endif
+        switch choice ?? "buckets" {
+        case "buckets": return nil
+        case "auto":
+            let longest = records.map(\.healingRow.length).max() ?? 0
+            return longest == 0 ? nil : (longest + 63) / 64 * 64
+        case let n:
+            guard let k = Int(n), k > 0 else { throw RunnerError.config("pipeline.sequenceLength '\(n)': a token count, auto or buckets") }
+            return k
+        }
+    }
+
     func pipelineOptions(_ p: RunnerConfig.Pipeline?, records: [RowRecord], cp: Gemma4Checkpoint) throws -> BlockPipelineOptions {
         var o = BlockPipelineOptions()
         if let x = p?.batchSteps { o.batchSteps = x }
@@ -53,6 +72,13 @@ extension Run {
         o.storageDType = try parseDType(p?.storageDType)
         if let x = p?.maxBatchTokens { o.maxBatchTokens = x }
         if let x = p?.maxBatchRows { o.maxBatchRows = x }
+        if let t = p?.teacherPass {
+            guard let pass = TeacherPass(rawValue: t) else { throw RunnerError.config("pipeline.teacherPass '\(t)': block or batch") }
+            o.teacherPass = pass
+        }
+        if let x = p?.teacherStateBudgetGB { o.teacherStateBudgetBytes = Int(x * gibibyte) }
+        if let x = p?.padWalks { o.padWalks = x }
+        o.fixedSequenceLength = try fixedSequenceLength(p?.sequenceLength?.value, records: records)
         o.maxBlocks = p?.maxBlocks
         o.tokenChunk = c.memory?.tokenChunk
         if let r = c.memory?.mergedMaxKeptRatio { ExpertCompute.mergedMaxKeptRatio = r }
@@ -117,6 +143,7 @@ extension Run {
         for b in report.blocks {
             log("run: block \(b.block + 1): \(b.residentLayers) layers resident, \(String(format: "%.3f", b.secondsPerStep)) s/step (median-free mean after the first), training peak \(gb(b.trainingPeakBytes))")
         }
+        log("run: \(report.compiledTraces) compiled-function traces and \(report.walkShapes) distinct teacher-walk kernel shapes in this run\(StreamedBlockHealer.fixedSequenceLength.map { " (fixed sequence length \($0))" } ?? "")")
         log("run: other stages peaked at \(gb(report.otherStagesPeakBytes)), training at \(gb(report.trainingPeakBytes)); frontier on disk \(gb(report.frontierBytes))")
         if case .stopped(let step, let why) = report.outcome { return .stopped("pipeline: \(why) (step \(step))") }
         if options.fixedKeep == nil {

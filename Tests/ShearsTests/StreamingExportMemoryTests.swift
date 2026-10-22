@@ -90,7 +90,17 @@ final class StreamingExportMemoryTests: ShearsTestCase {
         // Exporting 24 layers costs no more than 6 (plus slack for allocator rounding), and a full-precision bank
         // of one layer is the most it may need on top of the embedding table.
         let embedding = 2048 * d * 2
-        XCTAssertLessThan(big, bankBF16 + 3 * embedding, "peak \(big) vs one bank \(bankBF16)")
+        // On Linux CPU (CI) the same export peaks about 3.7 MB higher at every depth (45.8 MB at 6 layers and 46.1 MB at
+        // 24, against 42.3 MB for both on macOS) and so just over the bound below: MLX's CPU backend allocates the
+        // temporaries of its quantized ops differently from Metal. That is a constant, not growth, and the depth check
+        // below (the one that catches a held model) is unchanged, so only the absolute bound gets a quarter bank of
+        // headroom there. The old export peaked at several banks (a shard of five layers).
+        #if os(Linux)
+        let backendSlack = bankBF16 / 4
+        #else
+        let backendSlack = 0
+        #endif
+        XCTAssertLessThan(big, bankBF16 + 3 * embedding + backendSlack, "peak \(big) vs one bank \(bankBF16)")
         XCTAssertLessThan(Double(big), Double(small) * 1.25 + 4_000_000, "peak grows with depth: \(small) -> \(big)")
         XCTAssertLessThan(big, 24 * bankBF16 / 8)
     }
