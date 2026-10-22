@@ -5,9 +5,6 @@ name: Linux
 on:
   push:
     branches: [prebuilt-binary, main]
-    paths-ignore:
-      - .github/workflows/diag.yml
-      - Tests/ShearsTests/ZDiagTests.swift
   pull_request:
   workflow_dispatch:
 
@@ -88,6 +85,7 @@ jobs:
 
       - name: swift test
         run: |
+          grep -m1 'model name' /proc/cpuinfo | tee -a "$GITHUB_STEP_SUMMARY"
           swift package resolve
           swift package edit mlx-swift --path "$HOME/mlx-swift"
           # The verdict step below decides; keep the exit status for it.

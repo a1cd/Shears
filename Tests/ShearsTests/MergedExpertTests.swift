@@ -298,13 +298,14 @@ final class MergedExpertTests: ShearsTestCase {
     // MARK: the real code path: block pipeline, compiled steps, checkpointing, optimizer
 
     func pipelineRun(
-        _ t: BlockPipelineTests, _ s: BlockPipelineTests.Setup, merged: Bool, chunk: Int?, shared: Bool = false
+        _ t: BlockPipelineTests, _ s: BlockPipelineTests.Setup, merged: Bool, chunk: Int?, shared: Bool = false,
+        steps: Int = 4
     ) throws -> (losses: [Float], adapters: [String: MLXArray], built: Int) {
         ExpertCompute.merged = merged
         ExpertCompute.mergedMaxKeptRatio = 100
         defer { ExpertCompute.merged = true; ExpertCompute.mergedMaxKeptRatio = 1.5; ExpertCompute.tokenChunk = nil }
         var o = BlockPipelineOptions()
-        o.batchSteps = 4
+        o.batchSteps = steps
         o.mix = .clean
         o.fixedKeep = s.keep
         o.storageDType = .float32
@@ -316,12 +317,18 @@ final class MergedExpertTests: ShearsTestCase {
         let dir = try tempDir()
         let before = ExpertCompute.mergedBranchCount
         let p = try BlockPipeline(source: try s.source, blockEnds: s.ends, adapterConfiguration: ac, configuration: c, options: o, directory: dir)
-        let r = try p.run(rows: ShuffledRows(rows: s.rows, seed: 4), steps: 4)
+        let r = try p.run(rows: ShuffledRows(rows: s.rows, seed: 4), steps: steps)
         XCTAssertTrue(StreamedBlockHealer.compileLayerSteps)
         return (r.blocks[0].losses, r.adapters, ExpertCompute.mergedBranchCount - before)
     }
 
     func testPipelineTrainingIsTheSameInMergedAndRoutedLayouts() throws {
+        // Four optimizer steps amplify float32 rounding differences between the layouts. On the CPU backend the
+        // worst adapter difference is 1.9e-4 on one CPU (AMD EPYC 7763, run alone) and 7.4e-4 in a full run on
+        // another (the same tensor each time, layers.0.mlp_up.a, keep 2), against 5e-4 on Metal. The step-1 and
+        // step-2 differences are 0 and 3.5e-6, so this is growth through training, not a layout error.
+        let cpu = Device.defaultDevice().deviceType == .cpu
+        let atol: Float = cpu ? 2e-3 : 5e-4
         for (keep, chunk, shared) in [(2, nil, false), (4, nil, false), (4, 7, false), (4, nil, true)] as [(Int, Int?, Bool)] {
             let t = BlockPipelineTests()
             let setup = try t.setup(layers: 4, ends: [3], keepCount: keep, rowCount: 3, length: 20)
@@ -332,9 +339,16 @@ final class MergedExpertTests: ShearsTestCase {
             XCTAssertEqual(merged.losses.count, routed.losses.count)
             for (a, b) in zip(merged.losses, routed.losses) { XCTAssertEqual(a, b, accuracy: 2e-4 * max(1, abs(b))) }
             XCTAssertEqual(Set(merged.adapters.keys), Set(routed.adapters.keys))
+            // After two steps the layouts agree to float32 rounding (0 to 3.5e-6 measured on a CPU, keep 2), so a
+            // layout bug cannot hide behind the looser four-step bound below.
+            let routed2 = try pipelineRun(t, setup, merged: false, chunk: chunk, shared: shared, steps: 2)
+            let merged2 = try pipelineRun(t, setup, merged: true, chunk: chunk, shared: shared, steps: 2)
+            for (k, v) in routed2.adapters {
+                assertClose(merged2.adapters[k]!, v, atol: cpu ? 2e-4 : 5e-4, rtol: 5e-3, "two steps, keep \(keep) chunk \(String(describing: chunk)) \(k)")
+            }
             var moved = 0
             for (k, v) in routed.adapters {
-                assertClose(merged.adapters[k]!, v, atol: 5e-4, rtol: 5e-3, "keep \(keep) chunk \(String(describing: chunk)) \(k)")
+                assertClose(merged.adapters[k]!, v, atol: atol, rtol: 5e-3, "keep \(keep) chunk \(String(describing: chunk)) \(k)")
                 if k.contains(".experts.") && k.hasSuffix("_b") && abs(v).max().item(Float.self) > 0 { moved += 1 }
             }
             XCTAssertGreaterThan(moved, 0, "expert adapters actually trained")

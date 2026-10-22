@@ -264,6 +264,11 @@ final class ResidencyTests: ShearsTestCase {
     // MARK: memory budget
 
     func testABudgetIsRespectedAndPicksTheLargestFittingWindow() throws {
+        #if !canImport(Darwin)
+        try XCTSkipUnless(
+            MappedSafetensors.zeroCopySupported,
+            "the peak this test compares exists because a smaller resident window leaves weights unmapped; the CPU and CUDA allocators copy them, so the peak does not fall by a reliable margin (CI: one resident layer 21,409,776 B against 20,705,972 B for the whole block in one run, the expected order in another run of the same code)")
+        #endif
         let s = try setup()
         // Unconstrained peak, then budgets between the whole-block estimate and the one-layer one.
         let free = try train(s, resident: nil, steps: 2)
