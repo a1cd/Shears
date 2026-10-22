@@ -171,6 +171,37 @@ jobs:
           # Expected to fail (no driver, no device); the message is what a user without a GPU would see.
           "$d/shears-cli-linux-x86_64-cuda/bin/shears-cli" device || echo "exit status $? (expected on a runner without a GPU)"
 
+      - name: The notebook's gemma configs are accepted by this binary (and a bad one is not)
+        run: |
+          # No GPU and no model here: shears-cli decodes the config first, so a config error shows up before MLX fails on the missing GPU.
+          d=$(mktemp -d); stub=$(mktemp -d)
+          ln -s "$(ls /usr/local/cuda/lib64/stubs/libcuda.so)" "$stub/libcuda.so.1"
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          python3 -I - "$d" <<'EOF'
+          import json, sys, types, os, pathlib
+          d = pathlib.Path(sys.argv[1])
+          nb = json.load(open("Notebooks/Shears.ipynb"))
+          src = next("".join(c["source"]) for c in nb["cells"] if "".join(c["source"]).startswith("# 3g.2"))
+          ns = dict(os=os, json=json, subprocess=types.SimpleNamespace(run=None), IS_MAC=False, DEVICE="gpu",
+                    GPU={"name": "T4", "cc": 7.5, "mem_mib": 15360}, GEMMA_STEPS_PER_BLOCK=10, MODEL="gemma", GEMMA_DIR=d, SHEARS_CLI="x")
+          # run the config cell without its dry run: keep everything up to the shears-cli check
+          exec(src.split("    # Does shears-cli accept the config?")[0] + "else:\n    pass\n", ns)
+          bad = dict(ns["GEMMA_CONFIG"], notAKey=1)
+          json.dump(bad, open(d / "config-bad.json", "w"))
+          EOF
+          cd "$d"
+          export LD_LIBRARY_PATH="$stub:/usr/local/cuda/lib64"
+          cli=shears-cli-linux-x86_64-cuda/bin/shears-cli
+          for cfg in config.json config-export.json; do
+            cmd=run; [ "$cfg" = config-export.json ] && cmd=export
+            out=$("$cli" $cmd --config "$cfg" 2>&1 || true)
+            echo "== $cmd --config $cfg"; echo "$out" | tail -3
+            if echo "$out" | grep -qE "shears-cli: config:|DecodingError|keyNotFound|typeMismatch|valueNotFound|dataCorrupted"; then echo "::error::$cfg is not accepted"; exit 1; fi
+          done
+          out=$("$cli" run --config config-bad.json 2>&1 || true)
+          echo "== run --config config-bad.json (must be rejected)"; echo "$out" | tail -3
+          echo "$out" | grep -q "unknown key 'notAKey'"
+
       - name: Summary
         run: |
           f=dist/shears-cli-linux-x86_64-cuda.tar.gz
