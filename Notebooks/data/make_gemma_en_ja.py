@@ -77,8 +77,11 @@ if __name__ == "__main__":
     if "--dry-run" in sys.argv:
         sys.exit(0)
     key = os.environ.get("OR_KEY", "").strip()
-    if not key or not hashlib.sha256(key.encode()).hexdigest().startswith("c43720dc1924"):
-        sys.exit("OR_KEY is not the debug key (its sha256 does not start with c43720dc1924): stopping")
+    if not key:
+        sys.exit("set OR_KEY to an OpenRouter API key: stopping")
+    want = os.environ.get("OR_KEY_SHA_PREFIX")        # optional: refuse to run with any other key (a guard against using the wrong one)
+    if want and not hashlib.sha256(key.encode()).hexdigest().startswith(want):
+        sys.exit("OR_KEY is not the key whose sha256 starts with OR_KEY_SHA_PREFIX: stopping")
     out, provider, cost = [], None, 0.0
     for i, r in enumerate(segs):
         resp = call(key, r["source"], provider)
