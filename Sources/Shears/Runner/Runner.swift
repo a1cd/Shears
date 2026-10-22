@@ -546,7 +546,8 @@ final class Run {
         let cp = try checkpoint()
         let keep = try keepSets(cp)
         let dtype = try parseDType(c.export?.dtype) ?? .bfloat16
-        var adapters: ModelAdapters?
+        var adapterConfig: AdapterConfiguration?
+        var layerAdapters: MergeAndSliceExport.LayerAdaptersProvider?
         let spec = c.export?.adapters
         if spec != "none" {
             let url: URL
@@ -558,26 +559,43 @@ final class Run {
                 throw RunnerError.config("export needs 'export.adapters' (a file, or 'none') or at least one stage")
             }
             guard fm.fileExists(atPath: url.path) else { throw RunnerError.config("no adapters at \(url.path); run heal first") }
-            let student = try cp.loadModel(keeping: keep, dtype: try loadDType)
             let n = cp.configuration.numExperts ?? 0
-            var ac = try adapterConfiguration(model: student, cp: cp, keptExperts: keep.first?.count ?? 0)
+            var ac = try adapterConfiguration(cp: cp, keptExperts: keep.first?.count ?? 0)
             if ac.qat != nil { ac.qat?.exportDType = dtype }
-            let ma = ModelAdapters(
-                layers: student.healableLayers, sets: keep.map { ExpertSet(keep: $0, numExperts: n) }, configuration: ac)
-            try ma.load(tensors: try loadArrays(url: url))
-            adapters = ma
+            // The file's tensors are lazy handles; each layer's adapters are built from its own tensors when that
+            // layer is merged, so no model is loaded to get their shapes and the others' are never read.
+            let tensors = try loadArrays(url: url)
+            let layers = Set(tensors.keys.compactMap { k -> Int? in
+                let parts = k.split(separator: ".", maxSplits: 2)
+                return parts.count == 3 && parts[0] == "layers" ? Int(parts[1]) : nil
+            })
+            if let extra = layers.max(), extra >= cp.configuration.numHiddenLayers {
+                throw HealingError.adapterMismatch("\(url.path) has adapters for layer \(extra) but the model has \(cp.configuration.numHiddenLayers) layers")
+            }
+            adapterConfig = ac
+            let configuration = ac
+            layerAdapters = { i, layer, _ in
+                let ma = ModelAdapters(
+                    layers: [layer], firstLayer: i, sets: [ExpertSet(keep: keep[i], numExperts: n)], configuration: configuration)
+                try ma.load(subsetOf: tensors)
+                return ma.layers[0]
+            }
         }
         var o = MergeAndSliceExport.Options()
         o.dtype = dtype
         if let x = c.export?.layersPerShard { o.layersPerShard = x }
         o.sourceDirectory = c.resolve(c.model)
+        o.log = { self.log("export: \($0)") }
         let target = exportDirectory
         let tmp = target.deletingLastPathComponent().appendingPathComponent(target.lastPathComponent + ".partial")
         try? fm.removeItem(at: tmp)
         try fm.createDirectory(at: tmp.deletingLastPathComponent(), withIntermediateDirectories: true)
-        log("export: merging \(adapters == nil ? "no adapters (pruned model)" : "adapters") into \(keep.first?.count ?? 0) experts per layer, \(dtype)")
+        log("export: merging \(adapterConfig == nil ? "no adapters (pruned model)" : "adapters") into \(keep.first?.count ?? 0) experts per layer, \(dtype), one layer at a time")
+        let loadDType = try loadDType
         try MergeAndSliceExport.write(
-            checkpoint: cp, loadDType: try loadDType, keep: keep, adapters: adapters, to: tmp, options: o)
+            source: Gemma4LayerSource(checkpoint: cp, dtype: loadDType, mapWeights: c.memory?.mapWeights ?? true),
+            globals: { try cp.loadGlobalTensors(dtype: loadDType) }, configuration: cp.configuration, keep: keep,
+            adapterConfiguration: adapterConfig, layerAdapters: layerAdapters, to: tmp, options: o)
         try? fm.removeItem(at: target)
         try fm.moveItem(at: tmp, to: target)
         log("export: wrote \(target.path)")

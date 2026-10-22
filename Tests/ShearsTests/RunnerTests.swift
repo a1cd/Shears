@@ -283,6 +283,28 @@ final class RunnerTests: ShearsTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("out/export/config.json").path))
     }
 
+    /// `export` needs nothing a finished `run` leaves behind except the keep file and the adapters: a machine that
+    /// already has them (a Colab runtime that kept `out/`) can export without select or heal being redone.
+    func testExportRunsOnItsOwnFromTheKeepFileAndAdapters() throws {
+        let dir = try workspace(configEdit: { $0["export"] = ["adapters": "out/stage-pipeline/adapters.safetensors", "dtype": "bfloat16"] })
+        var quiet = RunEnvironment()
+        var lines: [String] = []
+        quiet.log = { lines.append($0) }
+        _ = try ShearsRunner.execute(.run, config: try config(dir), environment: quiet)
+        let fm = FileManager.default
+        // Everything the pipeline needed while it ran goes: the frontier, its manifest, checkpoints, the selection records.
+        for gone in ["out/pipeline", "out/select", "checkpoints", "store"] { try? fm.removeItem(at: dir.appendingPathComponent(gone)) }
+        XCTAssertEqual(ShearsRunner.main(arguments: ["shears-cli", "export", "--config", dir.appendingPathComponent("config.json").path], installSignalHandlers: false), 0)
+        let exported = try Gemma4Checkpoint(directory: dir.appendingPathComponent("out/export"))
+        XCTAssertEqual(exported.configuration.numExperts, 4)
+        XCTAssertFalse(fm.fileExists(atPath: dir.appendingPathComponent("out/export.partial").path))
+        // Layer by layer, and said so.
+        let files = try fm.contentsOfDirectory(atPath: dir.appendingPathComponent("out/export").path)
+        XCTAssertEqual(files.filter { $0.hasPrefix("model-layers-") }.count, 4)
+        let again = ShearsRunner.main(arguments: ["shears-cli", "export", "--config", dir.appendingPathComponent("config.json").path], installSignalHandlers: false)
+        XCTAssertEqual(again, 0, "an export over an export replaces it")
+    }
+
     func testSweepRunsEndToEndAndWritesATableAndJSON() throws {
         let dir = try workspace()
         var quiet = RunEnvironment()

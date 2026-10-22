@@ -35,13 +35,18 @@ struct ExportRecord: Codable, Equatable {
     /// The covered tensors of `adapters`' layers under their GGUF names.
     static func formats(of adapters: ModelAdapters) -> [String: QuantFormat] {
         var out: [String: QuantFormat] = [:]
-        for (i, la) in adapters.layers.enumerated() {
-            let p = "blk.\(adapters.firstLayer + i)."
-            for (site, f) in la.denseFormats { out[p + site.ggufName + ".weight"] = f }
-            if let e = la.experts {
-                if let f = e.gateUpFormat { out[p + "ffn_gate_up_exps.weight"] = f }
-                if let f = e.downFormat { out[p + "ffn_down_exps.weight"] = f }
-            }
+        for (i, la) in adapters.layers.enumerated() { out.merge(formats(of: la, layerIndex: adapters.firstLayer + i)) { $1 } }
+        return out
+    }
+
+    /// The covered tensors of one layer's adapters (model layer `layerIndex`) under their GGUF names.
+    static func formats(of la: LayerAdapters, layerIndex: Int) -> [String: QuantFormat] {
+        var out: [String: QuantFormat] = [:]
+        let p = "blk.\(layerIndex)."
+        for (site, f) in la.denseFormats { out[p + site.ggufName + ".weight"] = f }
+        if let e = la.experts {
+            if let f = e.gateUpFormat { out[p + "ffn_gate_up_exps.weight"] = f }
+            if let f = e.downFormat { out[p + "ffn_down_exps.weight"] = f }
         }
         return out
     }
