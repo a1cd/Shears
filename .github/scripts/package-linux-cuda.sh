@@ -6,7 +6,7 @@
 # cuDNN stay external (Colab's GPU image has them; the driver's libcuda.so.1 always comes from the machine). They are
 # listed in NVIDIA_LIBRARIES.txt and in BUILD_INFO.txt. Writes dist/shears-cli-linux-x86_64-cuda.tar.gz and .sha256.
 #
-# This build has never been run on a GPU. The package step only proves that the binary links and starts.
+# This build has not yet worked on a GPU (its first Colab T4 test aborted at start-up). The package step only proves that the binary links and starts.
 set -euo pipefail
 
 BIN="${1:-CLI/.build/release/shears-cli}"
@@ -79,7 +79,7 @@ LD_LIBRARY_PATH="$STUBDIR" "$PKG/bin/shears-cli" --help >/dev/null
 # Oldest glibc this binary can run on.
 GLIBC_NEEDED=$(objdump -T "$PKG/bin/shears-cli" "$PKG"/lib/* 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
 {
-  echo "shears-cli for Linux x86_64 (CUDA, MLX), Swift runtime linked statically. EXPERIMENTAL: never run on a GPU."
+  echo "shears-cli for Linux x86_64 (CUDA, MLX), Swift runtime linked statically. EXPERIMENTAL: crashed on its first GPU test."
   echo "commit:        ${GITHUB_SHA:-$(git rev-parse HEAD)}"
   echo "built:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "swift:         $(swift --version 2>&1 | head -1)"

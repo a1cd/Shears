@@ -1,3 +1,4 @@
+import CShearsDiag
 import Foundation
 import MLX
 import MLXNN
@@ -63,6 +64,7 @@ public enum ShearsRunner {
         """
 
     public static func main(arguments: [String], installSignalHandlers: Bool = true) -> Int32 {
+        shears_install_terminate_handler()
         var args = Array(arguments.dropFirst())
         guard let name = args.first else {
             FileHandle.standardError.write(Data((usage + "\n").utf8))
@@ -76,12 +78,27 @@ public enum ShearsRunner {
         if name == "device" {
             // One real op on the default device, so the answer is "what ran", not "what is installed": a build whose
             // GPU backend cannot start (no driver, a library of the wrong version) fails here, not later.
+            // Every stage goes to standard error, flushed, before it starts, so a crash shows how far it got.
+            func stage(_ text: String) {
+                FileHandle.standardError.write(Data(("device: " + text + "\n").utf8))
+            }
+            stage("choosing MLX's default device")
             let device = Device.defaultDevice().deviceType.rawValue
+            stage("default device is \(device)")
+            stage("creating a 4x4 array")
             let x = MLXArray((0 ..< 16).map { Float($0) }, [4, 4])
+            stage("evaluating x + x")
+            let doubled = x + x
+            eval(doubled)
+            stage("evaluating x @ x")
             let product = matmul(x, x)
+            eval(product)
+            stage("reading the sum back")
             let sum = product.sum().item(Float.self)
             print("mlx device: \(device)")
             print("probe: 4x4 matrix product on \(device), sum \(sum) (expected 3920)")
+            fflush(stdout)
+            stage("done, exiting")
             return sum == 3920 ? 0 : 1
         }
         if name == "sample" {

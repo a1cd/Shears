@@ -1,7 +1,7 @@
 name: Linux CUDA (experimental)
 
 # Builds shears-cli for Linux x86_64 with the MLX CUDA backend and publishes it as a PRE-RELEASE. The runner has no GPU:
-# this only COMPILES. The binary has never been run on a GPU; the Colab notebook is where that first happens.
+# this only COMPILES. Its first test on a GPU (Colab T4, 2026-10-22) crashed at start-up; see docs/linux.md.
 # See docs/linux.md. The CPU binary is built by linux.yml and is untouched by this workflow.
 on:
   push:
@@ -171,6 +171,17 @@ jobs:
           # Expected to fail (no driver, no device); the message is what a user without a GPU would see.
           "$d/shears-cli-linux-x86_64-cuda/bin/shears-cli" device || echo "exit status $? (expected on a runner without a GPU)"
 
+      - name: The terminate handler reports an exception thrown on a thread (and CI would notice if it did not)
+        run: |
+          d=$(mktemp -d); stub=$(mktemp -d)
+          ln -s "$(ls /usr/local/cuda/lib64/stubs/libcuda.so)" "$stub/libcuda.so.1"
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          export LD_LIBRARY_PATH="$stub:/usr/local/cuda/lib64"
+          out=$(SHEARS_TEST_TERMINATE=1 "$d/shears-cli-linux-x86_64-cuda/bin/shears-cli" --help 2>&1 || true)
+          echo "$out" | head -24
+          echo "$out" | grep -q "what(): test exception from SHEARS_TEST_TERMINATE"
+          echo "$out" | grep -q "backtrace"
+
       - name: The notebook's gemma configs are accepted by this binary (and a bad one is not)
         run: |
           # No GPU and no model here: shears-cli decodes the config first, so a config error shows up before MLX fails on the missing GPU.
@@ -206,7 +217,7 @@ jobs:
         run: |
           f=dist/shears-cli-linux-x86_64-cuda.tar.gz
           {
-            echo "### shears-cli, Linux x86_64, CUDA (experimental, never run on a GPU)"
+            echo "### shears-cli, Linux x86_64, CUDA (experimental, crashed on its first GPU test)"
             echo
             echo "tarball: $(du -h "$f" | cut -f1) ($(stat -c %s "$f") bytes)"
             echo
@@ -252,7 +263,7 @@ jobs:
 
       - name: Publish release assets
         run: |
-          notes="EXPERIMENTAL and UNTESTED. shears-cli for Linux x86_64 with the MLX CUDA backend, built from commit $GITHUB_SHA against CUDA 13.0 (Colab's GPU image). It was compiled on a machine with no GPU and has never been run on one. The NVIDIA libraries are not included: it needs libcuda.so.1 (the driver), libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libnvrtc.so.13 and libcudnn.so.9 on the library path, glibc 2.39 or newer, and g++. Device code for compute capability 7.5, 8.0 and 9.0. Used by Notebooks/Shears.ipynb on a Colab GPU runtime; the CPU build is the release linux-x86_64-latest. See docs/linux.md. Replaced on every push."
+          notes="EXPERIMENTAL and BROKEN so far. shears-cli for Linux x86_64 with the MLX CUDA backend, built from commit $GITHUB_SHA against CUDA 13.0 (Colab's GPU image). It was compiled on a machine with no GPU. Its first test on a GPU (a Colab T4) aborted at start-up with a C++ exception; this build prints the exception text and a backtrace. The NVIDIA libraries are not included: it needs libcuda.so.1 (the driver), libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libnvrtc.so.13 and libcudnn.so.9 on the library path, glibc 2.39 or newer, and g++. Device code for compute capability 7.5, 8.0 and 9.0. Used by Notebooks/Shears.ipynb on a Colab GPU runtime; the CPU build is the release linux-x86_64-latest. See docs/linux.md. Replaced on every push."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --prerelease --notes "$notes"
           else
