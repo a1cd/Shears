@@ -6,6 +6,16 @@ The notebook runs the commands below for you; this page is the reference for wha
 
 Tested 2026-10-21 on Ubuntu 24.04.5 LTS, x86_64, 4 cores, 15 GB RAM, **no GPU** (`nvidia-smi` and `nvcc` not installed). Everything under "Ran" was run; everything under "Read only" comes from reading source and was not executed.
 
+## The Colab notebook
+
+[`Notebooks/Shears.ipynb`](../Notebooks/Shears.ipynb) runs the commands on this page for you and then the tiny pipeline (`shears-cli sample`, `select`, `prepass`, `heal`, `export`), and loads the export with transformers. It also runs on an Apple Silicon Mac (where it uses `xcodebuild`). Facts about it:
+
+- **Run headless on a Mac** (`jupyter nbconvert --execute`, M3 Max): about 90 s for a cold `xcodebuild` of `shears-cli`, about 15 s for the whole tiny pipeline, 2 minutes in all including the transformers cell.
+- **Not run on Colab, and not run on x86_64 Linux in the notebook.** The Linux cells are the commands below, assembled; the pieces were run on an x86_64 Ubuntu 24.04 machine, the assembled notebook was not. Colab's image (Ubuntu 22.04 or 24.04, its Python and preinstalled packages) has not been tried; on 22.04 the notebook adds a PPA for `libstdc++-13`, which is untested.
+- **Setup time on Colab is unmeasured.** From the 4-core x86_64 numbers below (library about 2 min, release CLI about 5.5 min cold) expect 15 to 30 minutes on Colab's 2 vCPUs, mostly the MLX C++ build.
+- **The checkout directory must be called `Shears`.** SwiftPM names a path dependency after its directory, so `CLI/Package.swift`'s `.package(path: "..")` only resolves when the directory is `Shears`. The notebook copies or clones into `<work>/Shears` for that reason.
+- **transformers.** The export loads with `AutoModelForCausalLM` (a text-only `Gemma4ForCausalLM`; Gemma 4 appears in transformers 5.5.0, the notebook pins 5.20.2, the version tested). In float32 its top-5 next-token log-probabilities match `shears-serve` on the same export to four decimals. See [Quantization and export](quantization-and-export.md#loading-the-export-with-transformers).
+
 ## Ran: toolchain (verified commands)
 
 ```bash
@@ -88,4 +98,4 @@ Files changed: `.gitignore`, `Package.swift`, `Sources/Shears/{GatherMM,Portabil
 
 ## Still unverified
 
-Anything on a GPU: whether the SwiftPM CUDA build works with CUTLASS/cudnn-frontend added; CMake-built mlx-swift linked into Shears; CUDA 13.0 on Colab; T4/L4/A100/H100 numerics and the bf16 paths; `gatherQuantizedMM`/`vjp` CUDA-vs-CPU agreement. On CPU: the one failing test above; a Mac build of this branch (the Darwin branches are unchanged code moved under `#if`, but not compiled here); memory behaviour of real-size models; Colab's own image.
+Anything on a GPU: whether the SwiftPM CUDA build works with CUTLASS/cudnn-frontend added; CMake-built mlx-swift linked into Shears; CUDA 13.0 on Colab; T4/L4/A100/H100 numerics and the bf16 paths; `gatherQuantizedMM`/`vjp` CUDA-vs-CPU agreement. On CPU: the one failing test above; memory behaviour of real-size models; Colab's own image.
