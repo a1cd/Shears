@@ -1,6 +1,6 @@
 # Shears on Linux, Colab and CUDA
 
-Shears targets MLX on Apple Silicon. Linux is a secondary, CPU-only port that exists so the pipeline can be tried without a Mac, for example from the [Colab notebook](../Notebooks/Shears.ipynb). Speed, memory behaviour (no zero-copy mapping, no unified memory) and numerics differ from the Mac, so do not compare numbers across the two. The CUDA backend has never been run.
+Shears targets MLX on Apple Silicon. Linux is a secondary, CPU-only port that exists so the pipeline can be tried without a Mac, for example from the [Colab notebook](../Notebooks/Shears.ipynb). Speed, memory behaviour (no zero-copy mapping, no unified memory) and numerics differ from the Mac, so do not compare numbers across the two. **A CUDA build of `shears-cli` is compiled in CI (see [the CUDA binary](#the-cuda-binary-built-in-ci-never-run-on-a-gpu)), but it has never been run on a GPU.**
 
 The notebook runs the commands below only in its optional build-from-source cell; by default it downloads a prebuilt binary (see the next section). This page is the reference for what was verified and what was not.
 

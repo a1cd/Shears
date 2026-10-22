@@ -101,6 +101,22 @@ jobs:
           echo "CCCL now in $INC/cccl:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" | head -3 || true
           ls "$INC" | grep -E 'cutlass|cute|cudnn_frontend|cccl'
 
+      - name: cuda_jit_sources.h (MLX's CMake generates it; the SwiftPM build does not find the shipped copy)
+        run: |
+          # The .cu and .cpp files include it, and neither the CudaBuild plugin nor the C++ settings give it a search path.
+          # Regenerate it exactly as MLX's CMake does, compare with the copy mlx-swift ships, and put it where the compilers look.
+          d="$HOME/mlx-swift/Source/Cmlx/mlx/mlx/backend/cuda"
+          mkdir -p "$RUNNER_TEMP/jit" && cd "$RUNNER_TEMP/jit"
+          files=$(cd "$d" && ls device/*.h device/*.cuh | paste -sd: -)
+          cmake -DMLX_SOURCE_ROOT="$d" -DMLX_JIT_SOURCES="$files" -P "$d/bin2h.cmake"
+          ls -l gen/cuda_jit_sources.h
+          if cmp -s gen/cuda_jit_sources.h "$HOME/mlx-swift/Source/Cmlx/mlx-generated/cuda/cuda_jit_sources.h"; then
+            echo "identical to mlx-swift's shipped copy"
+          else
+            echo "differs from mlx-swift's shipped copy (using the regenerated one)"
+          fi
+          sudo cp gen/cuda_jit_sources.h /usr/local/cuda/include/
+
       - name: nvcc wrapper (one architecture list for the compile and the device-link step)
         run: |
           # encuda passes a single "-arch sm_NN" to nvcc, for compiling and for the device link. This wrapper replaces it with
