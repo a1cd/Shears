@@ -96,6 +96,11 @@ jobs:
           echo "CCCL headers in $CCCL_INC"
           grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$CCCL_INC/cuda/std/__cccl/" 2>/dev/null | head -3 || true
           echo "toolkit's own CCCL version:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" 2>/dev/null | head -3 || true
+          # licenses of the open-source headers that go into the tarball (MLX's run-time kernel compiler needs them)
+          mkdir -p "$T/licenses"
+          cp "$T/cutlass/LICENSE.txt" "$T/licenses/CUTLASS-LICENSE.txt"
+          cp "$(ls -d "$T"/cccl/*/LICENSE.txt "$T"/cccl/LICENSE.txt 2>/dev/null | head -1)" "$T/licenses/CCCL-LICENSE.txt"
+          echo "SHEARS_EXTRA_LICENSES=$T/licenses" >> "$GITHUB_ENV"
           sudo mkdir -p "$INC/cccl"
           sudo cp -r "$CCCL_INC"/. "$INC/cccl/"
           echo "CCCL now in $INC/cccl:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" | head -3 || true
@@ -160,6 +165,22 @@ jobs:
 
       - name: Bundle (NVIDIA libraries are not bundled)
         run: .github/scripts/package-linux-cuda.sh CLI/.build/release/shears-cli
+
+      - name: The tarball carries the headers MLX's run-time kernel compiler needs (NVRTC, no GPU required)
+        run: |
+          d=$(mktemp -d)
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          # What Colab's image has: the toolkit's include directory without CUTLASS, cuDNN frontend or this build's extras, and the toolkit's own CCCL.
+          fake=$(mktemp -d); stock=$(mktemp -d)
+          (cd "$stock" && apt-get download cuda-cccl-$CUDA_PACKAGE_VERSION >/dev/null && dpkg -x ./*.deb x)
+          stock_cccl=$(find "$stock/x" -type d -path '*include/cccl' | head -1)
+          echo "stock CCCL: $stock_cccl"
+          for e in /usr/local/cuda/include/*; do
+            case "$(basename "$e")" in cute|cutlass|cudnn_frontend*|cudnn_backend_base.h|cuda_jit_sources.h|cccl) ;; *) ln -s "$e" "$fake/";; esac
+          done
+          ln -s "$stock_cccl" "$fake/cccl"
+          python3 -I .github/scripts/check_jit_headers.py "$d/shears-cli-linux-x86_64-cuda" \
+            "$HOME/mlx-swift/Source/Cmlx/mlx/mlx/backend/cuda/device" "$fake" "$stock_cccl" "$(ls /usr/local/cuda/lib64/libnvrtc.so.13)"
 
       - name: Run on a machine with no GPU (informational, shows what the failure looks like)
         continue-on-error: true

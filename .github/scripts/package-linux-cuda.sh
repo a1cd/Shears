@@ -61,6 +61,16 @@ for r in "$(dirname "$BIN")"/*.resources "$(dirname "$BIN")"/*.bundle; do
   [ -e "$r" ] && { cp -r "$r" "$PKG/bin/"; echo "copied resource bundle $r"; }
 done
 
+# Headers for MLX's run-time kernel compiler (NVRTC). MLX embeds the sources of mlx/backend/cuda/device/*.cuh and compiles them when
+# first needed (a GEMM, a fused elementwise op) with --include-path=<bundle root>/include and <bundle root>/include/cccl before the
+# toolkit's own directory (jit_module.cpp). Those sources include CUTLASS/CuTe and CCCL headers, which a user's CUDA toolkit does not
+# have (or has in another version). Open-source headers, not NVIDIA libraries: CUTLASS (BSD-3-Clause), CCCL (Apache-2.0 with LLVM exception).
+JITINC="${SHEARS_JIT_HEADERS_DIR:-/usr/local/cuda/include}"
+mkdir -p "$PKG/include/cccl"
+cp -r "$JITINC/cute" "$JITINC/cutlass" "$PKG/include/"
+cp -r "$JITINC/cccl/cuda" "$JITINC/cccl/nv" "$PKG/include/cccl/"
+test -f "$PKG/include/cute/tensor.hpp" -a -f "$PKG/include/cutlass/cutlass.h" -a -f "$PKG/include/cccl/cuda/std/array"
+
 # Verify with a stand-in libcuda.so.1 (the CUDA toolkit's link stub; a runner has no driver): nothing may be unresolved
 # apart from the NVIDIA libraries, and every bundled soname must resolve into the bundle.
 STUBDIR=$(mktemp -d)
@@ -90,9 +100,12 @@ GLIBC_NEEDED=$(objdump -T "$PKG/bin/shears-cli" "$PKG"/lib/* 2>/dev/null | grep 
   echo "run time:      g++ must be installed (MLX compiles fused CPU kernels with it); an NVIDIA driver (libcuda.so.1)"
   echo "NVIDIA libs (NOT bundled, must be on the library path): $(tr '\n' ' ' < "$PKG/NVIDIA_LIBRARIES.txt")"
   echo "bundled libs:  $(ls "$PKG/lib" | tr '\n' ' ')"
+  echo "headers:       include/cute, include/cutlass (CUTLASS), include/cccl/cuda and nv (CCCL): for MLX's run-time kernel compiler"
 } | tee "$PKG/BUILD_INFO.txt"
 
 cp LICENSE THIRD_PARTY_NOTICES.md "$PKG/"
+mkdir -p "$PKG/licenses"
+if [ -n "${SHEARS_EXTRA_LICENSES:-}" ] && [ -d "$SHEARS_EXTRA_LICENSES" ]; then cp "$SHEARS_EXTRA_LICENSES"/* "$PKG/licenses/"; fi
 # License texts for what was bundled (Debian ships them per package).
 mkdir -p "$PKG/licenses"
 while read -r soname path; do
