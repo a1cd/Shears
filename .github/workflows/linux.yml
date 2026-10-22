@@ -5,6 +5,9 @@ name: Linux
 on:
   push:
     branches: [prebuilt-binary, main]
+    paths-ignore:
+      - .github/workflows/diag.yml
+      - Tests/ShearsTests/ZDiagTests.swift
   pull_request:
   workflow_dispatch:
 
