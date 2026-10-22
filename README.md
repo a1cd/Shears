@@ -1,6 +1,6 @@
 # Shears
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/a1cd/Shears/blob/notebook/Notebooks/Shears.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/a1cd/Shears/blob/main/Notebooks/Shears.ipynb)
 
 Shears prunes a Mixture-of-Experts model (one built from many specialist sub-networks, called experts, of which each token uses only a few) by removing experts, then heals it by retraining what is left to recover the quality the pruning cost. It is written in Swift on [mlx-swift](https://github.com/ml-explore/mlx-swift), with no Python and nothing that can't ship in an app.
 
