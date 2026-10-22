@@ -112,3 +112,75 @@ jobs:
           echo "size of outputs: $(du -sh "$OUT" | cut -f1)"
           cp "$RUNNER_TEMP/nvcc.log" "$RUNNER_TEMP/nvcc-$P-$T.log"
           { echo "### nvcc P=$P threads=$T: $total s"; echo '```'; sort -t$'\t' -k3 -nr "$RUNNER_TEMP/nvcc.log" | head -12; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # The CUDA build in the shape the real workflow will have: cold with empty caches, then (a) the same build directory
+  # re-created with new inodes (what actions/cache gives back) and a Shears source touched, then (b) a fresh build
+  # directory with only the compiler caches (ccache + nvcc wrapper cache) kept.
+  cuda-probe:
+    if: contains(github.event.head_commit.message, '[cuda]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-linux
+      - uses: ./.github/actions/setup-cuda
+      - name: probe
+        working-directory: CLI
+        env:
+          SPM_CUDA: "1"
+          CUDA_ARCH: sm_75
+        run: |
+          set +e
+          export PATH="$HOME/nvcc-wrapper:/usr/local/cuda/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          export SHEARS_NVCC_LOG="$RUNNER_TEMP/nvcc.log" CCACHE_LOGFILE="$RUNNER_TEMP/ccache.log"
+          nproc; free -m | head -2; df -h / | tail -1
+          # what is running, every 5 s
+          ( while true; do echo "$(date +%s) $(ps -eo comm= | grep -E '^(nvcc|cicc|ptxas|fatbinary|cudafe\+\+|clang|clang-[0-9]+|swift-frontend|ld|ld.lld|ld.gold|encuda-tool|ccache|cc1plus)$' | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}') mem=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)"; sleep 5; done > "$RUNNER_TEMP/timeline.txt" ) &
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          build() {   # $1 = label, $2 = timeout seconds
+            local s=$(date +%s)
+            timeout "${2:-7200}" swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcufft > "$RUNNER_TEMP/$1.log" 2>&1; local rc=$?
+            echo "== $1: exit $rc, $(( $(date +%s) - s )) s; Compiling lines $(grep -c '\] Compiling ' "$RUNNER_TEMP/$1.log"), of which .cu $(grep -c 'Compiling .*\.cu to' "$RUNNER_TEMP/$1.log")"
+            tail -2 "$RUNNER_TEMP/$1.log" | cut -c1-200
+          }
+          ccache -z
+          build 1-cold
+          echo "--- ccache after cold"; ccache -s | grep -E 'Hits|Misses|Uncacheable|Errors|Cache size|Files'
+          echo "--- nvcc log: calls by mode / hit"; awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "%s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log"
+          echo "--- slowest nvcc calls"; sort -t$'\t' -k3 -nr "$RUNNER_TEMP/nvcc.log" | head -12
+          echo "--- peak RSS KB"; awk -F'\t' '{print $5}' "$RUNNER_TEMP/nvcc.log" | sort -n | tail -1
+          echo "--- sizes"; du -sh .build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc" "$HOME/mlx-swift"
+          tar -C "$HOME/.cache" --zstd -cf "$RUNNER_TEMP/caches.tzst" ccache shears-nvcc && ls -l "$RUNNER_TEMP/caches.tzst"
+          tar -C . --zstd -cf "$RUNNER_TEMP/build.tzst" .build && ls -l "$RUNNER_TEMP/build.tzst"
+          cp "$RUNNER_TEMP/timeline.txt" "$RUNNER_TEMP/timeline-cold.txt"
+          # (a) the build directory comes back with new inodes; no compiler caches; a Shears source is new
+          cp -a .build .build.copy && rm -rf .build && mv .build.copy .build
+          ( export CCACHE_DISABLE=1; unset SHEARS_NVCC_CACHE
+            build 2-restored-dir-noop 900
+            touch ../Sources/Shears/*.swift
+            build 3-restored-dir-shears-touched 1500 )
+          # (b) a fresh build directory, only the compiler caches kept
+          pkill -f 'swift-build' ; rm -rf .build
+          swift package resolve
+          swift package edit mlx-swift --path "$HOME/mlx-swift"
+          ccache -z
+          build 4-fresh-dir-warm-compiler-caches
+          ccache -s | grep -E 'Hits|Misses|Uncacheable|Errors'
+          awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "%s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log"
+      - name: timeline
+        if: always()
+        run: |
+          # one line per minute: the maximum of each process count seen in that minute
+          python3 - "$RUNNER_TEMP/timeline-cold.txt" <<'PY'
+          import sys,re,collections
+          rows=[l.split() for l in open(sys.argv[1]) if l.strip()]
+          t0=int(rows[0][0]); b=collections.OrderedDict()
+          for r in rows:
+              m=(int(r[0])-t0)//60; d=b.setdefault(m,{})
+              for kv in r[1:]:
+                  k,_,v=kv.partition('=')
+                  d[k]=min(int(v),d.get(k,10**9)) if k=='mem' else max(int(v),d.get(k,0))
+          for m,d in b.items(): print(m,' '.join(f'{k}={v}' for k,v in sorted(d.items())))
+          PY

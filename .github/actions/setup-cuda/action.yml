@@ -48,7 +48,7 @@ runs:
         # The toolkit ships its own CCCL under include/cccl; MLX pins another. Overwrite it with the pinned one.
         curl -fsSL -o "$T/cccl.zip" "https://github.com/NVIDIA/cccl/releases/download/$CCCL_TAG/cccl-$CCCL_TAG.zip"
         unzip -q "$T/cccl.zip" -d "$T/cccl"
-        CCCL_INC=$(ls -d "$T"/cccl/*/include "$T"/cccl/include 2>/dev/null | head -1)
+        CCCL_INC=$(ls -d "$T"/cccl/*/include "$T"/cccl/include 2>/dev/null | head -1 || true)   # composite steps run with pipefail: ls exits 2 for the missing one
         echo "CCCL headers in $CCCL_INC"
         grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$CCCL_INC/cuda/std/__cccl/" 2>/dev/null | head -3 || true
         echo "toolkit's own CCCL version:"; grep -rhm1 -E "define CCCL_(MAJOR|MINOR|PATCH)_VERSION" "$INC/cccl/cuda/std/__cccl/" 2>/dev/null | head -3 || true
