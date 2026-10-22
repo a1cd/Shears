@@ -56,14 +56,37 @@ public final class InferenceRuntime {
 
     /// The prompt token ids for a chat: the template's rendering, encoded without any extra special tokens
     /// (the template writes `<bos>` itself).
+    ///
+    /// Message text is data: a control token written in it (`<turn|>`, `<|channel>`, `<bos>`, ...) from the
+    /// system prompt, a user, an assistant turn, a tool call or a tool reply is encoded as the plain characters it
+    /// spells, never as the special token, so no message can forge a turn boundary. Only the template's own
+    /// markup produces special tokens.
     public func promptTokens(
         messages: [[String: Any]], tools: [[String: Any]]? = nil, addGenerationPrompt: Bool = true,
         templateArguments: [String: Any] = [:]
     ) throws -> [Int] {
         guard let chatTemplate else { throw InferenceError.missing("this model has no chat template") }
         let text = try chatTemplate.render(
-            messages: messages, tools: tools, addGenerationPrompt: addGenerationPrompt, extra: templateArguments)
-        return tokenizer.encode(text, addSpecialTokens: false)
+            messages: messages.map(escaped), tools: tools?.map(escaped), addGenerationPrompt: addGenerationPrompt,
+            extra: escaped(templateArguments))
+        return tokenizer.encode(templateOutput: text)
+    }
+
+    /// `value` with every string in it (and every dictionary key) passed through
+    /// ``BPETokenizer/escapingSpecialTokens(in:)``.
+    private func escaped(_ value: Any) -> Any {
+        switch value {
+        case let s as String: return tokenizer.escapingSpecialTokens(in: s)
+        case let d as [String: Any]: return escaped(d)
+        case let a as [Any]: return a.map(escaped)
+        default: return value
+        }
+    }
+
+    private func escaped(_ dictionary: [String: Any]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for (k, v) in dictionary { out[tokenizer.escapingSpecialTokens(in: k)] = escaped(v) }
+        return out
     }
 
     /// A request with this model's defaults: its sampling settings and end-of-generation tokens.

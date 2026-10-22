@@ -280,9 +280,53 @@ public final class BPETokenizer: @unchecked Sendable {
 
     // MARK: Encode
 
+    /// Marks a special token's text as plain text for ``encode(templateOutput:)``. A Unicode noncharacter, so it
+    /// never occurs in real text.
+    static let escapeMarker = Unicode.Scalar(0xFDD0)!
+
+    /// `text` with every special token's string (`<turn|>`, `<|channel>`, `<bos>`, ...) broken by an invisible
+    /// marker after its first character, so that ``encode(templateOutput:)`` encodes it as ordinary characters
+    /// and not as the control token, and so a chat template that searches message content for a control
+    /// string (Gemma's thinking stripper) does not find it either.
+    ///
+    /// This is for text that came from a user, an assistant or a tool, never for the chat template's own
+    /// markup. Any marker already in `text` is dropped first, so the input cannot forge an escape.
+    public func escapingSpecialTokens(in text: String) -> String {
+        let all = Array(text.unicodeScalars.filter { $0 != Self.escapeMarker })
+        var out = String.UnicodeScalarView()
+        var i = 0
+        while i < all.count {
+            if let candidates = addedByFirst[all[i]],
+                let hit = candidates.first(where: { c in
+                    c.special && i + c.scalars.count <= all.count && all[i ..< i + c.scalars.count].elementsEqual(c.scalars)
+                })
+            {
+                out.append(all[i])
+                out.append(Self.escapeMarker)
+                out.append(contentsOf: all[i + 1 ..< i + hit.scalars.count])
+                i += hit.scalars.count
+            } else {
+                out.append(all[i])
+                i += 1
+            }
+        }
+        return String(out)
+    }
+
+    /// Token ids for a chat template's rendering whose message text went through
+    /// ``escapingSpecialTokens(in:)``: the template's own control tokens become single ids, an escaped one
+    /// is encoded as the plain characters it spells.
+    public func encode(templateOutput text: String) -> [Int] {
+        encode(text, addSpecialTokens: false, honorEscapes: true)
+    }
+
     /// Token ids for `text`. Added tokens (`<bos>`, `<|turn>`, ...) written in the text become their single
     /// ids. With `addSpecialTokens`, the post-processor's template is applied (Gemma's has none).
     public func encode(_ text: String, addSpecialTokens: Bool = false) -> [Int] {
+        encode(text, addSpecialTokens: addSpecialTokens, honorEscapes: false)
+    }
+
+    private func encode(_ text: String, addSpecialTokens: Bool, honorEscapes: Bool) -> [Int] {
         var ids: [Int] = []
         let all = Array(text.unicodeScalars)
         var segment: [Unicode.Scalar] = []
@@ -300,7 +344,7 @@ public final class BPETokenizer: @unchecked Sendable {
                 ids.append(hit.id)
                 i += hit.scalars.count
             } else {
-                segment.append(all[i])
+                if !(honorEscapes && all[i] == Self.escapeMarker) { segment.append(all[i]) }
                 i += 1
             }
         }
