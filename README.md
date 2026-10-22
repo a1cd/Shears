@@ -1,8 +1,10 @@
 # Shears
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/a1cd/Shears/blob/notebook/Notebooks/Shears.ipynb)
+
 Shears prunes a Mixture-of-Experts model (one built from many specialist sub-networks, called experts, of which each token uses only a few) by removing experts, then heals it by retraining what is left to recover the quality the pruning cost. It is written in Swift on [mlx-swift](https://github.com/ml-explore/mlx-swift), with no Python and nothing that can't ship in an app.
 
-Needs macOS 14+, Swift 6.0 tools and mlx-swift 0.31 or later; iOS 17+ and visionOS 1+ build but are untested on a device ([iOS and visionOS](docs/ios-visionos.md)). This is a young project: see [Status](#status) for what has and hasn't been verified.
+Needs macOS 14+, Swift 6.0 tools and mlx-swift 0.31 or later (it also builds on x86_64 Linux on the CPU backend, as a way to try the pipeline on a tiny model: [Linux and Colab](docs/linux.md)); iOS 17+ and visionOS 1+ build but are untested on a device ([iOS and visionOS](docs/ios-visionos.md)). This is a young project: see [Status](#status) for what has and hasn't been verified.
 
 ## What it does
 
@@ -35,7 +37,7 @@ Two kinds of evidence, kept apart. The setup, the noise and the limits are in th
 
 ## Status
 
-Healing is ported for Gemma 4 only. The real Gemma 4 26B-A4B has been loaded, pruned, healed and exported on one machine (an M3 Max with 48 GB); the numbers above come from that, and its whole-model quality results are preliminary. Memory was measured on one block; the figures for a whole 26B run in the docs are still estimates ([memory](docs/memory.md#estimate-for-the-real-26b-a4b-derived-not-measured)). Nothing has been run on an iOS or visionOS device or simulator, and Linux and CUDA have not been tried. The full list is in [notes and status](docs/notes.md).
+Healing is ported for Gemma 4 only. The real Gemma 4 26B-A4B has been loaded, pruned, healed and exported on one machine (an M3 Max with 48 GB); the numbers above come from that, and its whole-model quality results are preliminary. Memory was measured on one block; the figures for a whole 26B run in the docs are still estimates ([memory](docs/memory.md#estimate-for-the-real-26b-a4b-derived-not-measured)). Nothing has been run on an iOS or visionOS device or simulator. Linux builds and passes its tests on the CPU backend (one test fails), but no CUDA GPU has been tried ([Linux and Colab](docs/linux.md)). The full list is in [notes and status](docs/notes.md).
 
 ## Install
 
@@ -67,6 +69,10 @@ let result = try runtime.generator.generate(runtime.request(promptTokens: prompt
 }
 ```
 
+## Try it without a Mac
+
+[`Notebooks/Shears.ipynb`](Notebooks/Shears.ipynb) builds Shears, prunes and heals a tiny random Gemma 4 MoE, exports it and loads the export with Hugging Face transformers. It runs top to bottom on an Apple Silicon Mac or on Colab (CPU, Linux). It shows the pipeline working; the real target is MLX on a Mac with Gemma 4 26B-A4B. Details and what is unverified: [Linux and Colab](docs/linux.md).
+
 ## Build and test
 
 For contributors. `swift test` can't compile MLX's Metal shaders. Use Xcode (needs the Metal Toolchain:
@@ -84,7 +90,7 @@ TEST_RUNNER_SHEARS_BENCH=1 xcodebuild test -scheme Shears -destination 'platform
 
 ## Docs
 
-[docs/README.md](docs/README.md) is the index: [healing](docs/healing.md), [memory](docs/memory.md), [command line and pipeline](docs/cli.md), [quantization and export](docs/quantization-and-export.md), [Gemma 4](docs/gemma4.md), [inference and serve](docs/inference-and-serve.md), [benchmarks](docs/benchmarks.md), [what's here](docs/library.md), [iOS and visionOS](docs/ios-visionos.md), [notes and status](docs/notes.md). Third-party code is credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[docs/README.md](docs/README.md) is the index: [healing](docs/healing.md), [memory](docs/memory.md), [command line and pipeline](docs/cli.md), [quantization and export](docs/quantization-and-export.md), [Gemma 4](docs/gemma4.md), [inference and serve](docs/inference-and-serve.md), [benchmarks](docs/benchmarks.md), [what's here](docs/library.md), [iOS and visionOS](docs/ios-visionos.md), [Linux and Colab](docs/linux.md), [notes and status](docs/notes.md). Third-party code is credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 

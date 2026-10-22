@@ -41,8 +41,8 @@
   is measured for block 0 only, and the whole-model two-task run is preliminary (small samples, an unexplained loss on other
   languages). The memory figures for a whole 26B run in [Memory](memory.md#estimate-for-the-real-26b-a4b-derived-not-measured)
   are still estimates.
-- Nothing has been run on an iOS or visionOS device or simulator (see [iOS and visionOS](ios-visionos.md)), and Linux and CUDA have
-  not been tried.
+- Nothing has been run on an iOS or visionOS device or simulator (see [iOS and visionOS](ios-visionos.md)), and no CUDA GPU has been tried
+  (Linux on the CPU backend has: [Linux and Colab](linux.md)).
 - K-quant bit-exactness against `ggml` is tested only behind `TEST_RUNNER_SHEARS_KQUANT_ORACLE` / `TEST_RUNNER_SHEARS_LLAMA_BIN`; reference vectors for the default suite have not been checked in (they must come from the reference build, never from this package's own quantizer).
 - The loader ignores `quantization.mode`, so mxfp4/nvfp4 conversions fail loudly rather than load.
 - For Qwen3-MoE, attention isn't mapped, so healing covers the MoE MLP half of each decoder layer only.

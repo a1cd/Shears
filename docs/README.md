@@ -13,4 +13,5 @@ The front page is the [README](../README.md). The detail lives here, split by to
 | [Benchmarks](benchmarks.md) | The real Gemma 4 26B-A4B runs (memory, speed, energy, parity, a two-task whole-model run), speed on toys, and checkpointing. |
 | [What's here](library.md) | The table of types: what each one does. |
 | [iOS and visionOS](ios-visionos.md) | What builds, and what needs runtime testing. |
+| [Linux and Colab](linux.md) | The Linux CPU port, the Colab notebook, the verified install commands, and what is only read, not run (CUDA). |
 | [Notes and status](notes.md) | Things worth knowing, and not done yet. |

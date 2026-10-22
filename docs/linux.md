@@ -1,4 +1,8 @@
-# Shears on x86_64 Linux and CUDA
+# Shears on Linux, Colab and CUDA
+
+Shears targets MLX on Apple Silicon. Linux is a secondary, CPU-only port that exists so the pipeline can be tried without a Mac, for example from the [Colab notebook](../Notebooks/Shears.ipynb). Speed, memory behaviour (no zero-copy mapping, no unified memory) and numerics differ from the Mac, so do not compare numbers across the two. The CUDA backend has never been run.
+
+The notebook runs the commands below for you; this page is the reference for what was verified and what was not.
 
 Tested 2026-10-21 on Ubuntu 24.04.5 LTS, x86_64, 4 cores, 15 GB RAM, **no GPU** (`nvidia-smi` and `nvcc` not installed). Everything under "Ran" was run; everything under "Read only" comes from reading source and was not executed.
 
@@ -23,7 +27,7 @@ apt-get install -y libcurl4-openssl-dev libxml2-dev libz3-dev \
 
 Both are bugs in mlx-swift's SwiftPM Linux path (still present on its `main` as of today), not in Shears.
 
-1. **MLXNN does not compile.** With `SPM_CUDA=0` the manifest excludes `MLXFast.swift` and `mlx-c/.../fast.cpp`, but MLXNN uses `MLXFast` (RMSNorm, LayerNorm, RoPE, attention). Fix: `mlx-swift-linux-cpu.patch` (two deleted lines). With it, `MLXFast` links and runs on CPU.
+1. **MLXNN does not compile.** With `SPM_CUDA=0` the manifest excludes `MLXFast.swift` and `mlx-c/.../fast.cpp`, but MLXNN uses `MLXFast` (RMSNorm, LayerNorm, RoPE, attention). Fix: [`Notebooks/mlx-swift-linux-cpu.patch`](../Notebooks/mlx-swift-linux-cpu.patch) (two deleted lines). With it, `MLXFast` links and runs on CPU.
 2. **`compile` crashes on x86_64.** The shipped `mlx-generated/compiled_preamble.cpp` was generated on arm64 (`using ::float16_t;`), so every compiled function fails in g++ with "'float16_t' has not been declared". Fix: regenerate it on the host with MLX's own script.
 
 ```bash
@@ -58,7 +62,7 @@ Times on this 4-core machine: library debug build about 2 min cold, CLI release 
 
 The progress line's "mlx peak" reads 0.00 GB on CPU; use the process footprint there.
 
-## Failures found and fixed (all on branch `cloud-linux-x86`)
+## Failures found and fixed
 
 | Problem | Fix |
 |---|---|
@@ -72,7 +76,7 @@ The progress line's "mlx peak" reads 0.00 GB on CPU; use the process footprint t
 | `[GatherMM::eval] Currently only supports float32` aborts every bf16 MoE path on CPU | `GatherMM.swift` shadows `gatherMM` in the module: float32 on a CPU device, MLX's own otherwise |
 | Tests: `Darwin.*`, `URLSession` (FoundationNetworking), `XCTestCase()` has no `init()` in corelibs XCTest, `getrusage` type, `proc_pid_rusage` | per-platform aliases and imports; helper init; footprint benchmark skips off macOS |
 
-Files changed: `.gitignore`, `Package.swift`, `Sources/Shears/{GatherMM,Portability}.swift` (new), `Sources/Shears/Healing/{ReadAhead}.swift` (new), `Sources/Shears/Healing/{MappedSafetensors,ProcessMemory,StreamedBlockHealing,TeacherPrepass}.swift`, `Sources/Shears/GGUF/{GGUFGemma4,GGUFGenerationConfig}.swift`, `Sources/Shears/Inference/ChatTemplate.swift`, `Sources/Shears/Inference/Server/HTTPServer.swift`, `Tests/ShearsTests/{InferenceServerTests,KQuantOracleTests,PrepareMemoryBenchmark,ResidencyBenchmarkTests,ResidencyTests,RunnerTests,TestSupport,TopKFormTests}.swift`, plus these notes and the patch. `Package.resolved` files were not committed (Linux adds swift-crypto and swift-argument-parser pins).
+Files changed: `.gitignore`, `Package.swift`, `Sources/Shears/{GatherMM,Portability}.swift` (new), `Sources/Shears/Healing/{ReadAhead}.swift` (new), `Sources/Shears/Healing/{MappedSafetensors,ProcessMemory,StreamedBlockHealing,TeacherPrepass}.swift`, `Sources/Shears/GGUF/{GGUFGemma4,GGUFGenerationConfig}.swift`, `Sources/Shears/Inference/ChatTemplate.swift`, `Sources/Shears/Inference/Server/HTTPServer.swift`, `Tests/ShearsTests/{InferenceServerTests,KQuantOracleTests,PrepareMemoryBenchmark,ResidencyBenchmarkTests,ResidencyTests,RunnerTests,TestSupport,TopKFormTests}.swift`, plus this page and the patch. `Package.resolved` files were not committed (Linux adds swift-crypto and swift-argument-parser pins).
 
 ## Read only: CUDA
 
