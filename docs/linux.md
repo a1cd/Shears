@@ -10,7 +10,7 @@ Tested 2026-10-21 on Ubuntu 24.04.5 LTS, x86_64, 4 cores, 15 GB RAM, **no GPU** 
 
 [`Notebooks/Shears.ipynb`](../Notebooks/Shears.ipynb) runs the commands on this page for you and then the tiny pipeline (`shears-cli sample`, `select`, `prepass`, `heal`, `export`), and loads the export with transformers. It also runs on an Apple Silicon Mac (where it uses `xcodebuild`). Facts about it:
 
-- **Run headless on a Mac** (`jupyter nbconvert --execute`, M3 Max): about 90 s for a cold `xcodebuild` of `shears-cli`, about 15 s for the whole tiny pipeline, 2 minutes in all including the transformers cell.
+- **Run headless on a Mac** (`jupyter nbconvert --execute`, M3 Max): about 100 s for a cold `xcodebuild` of `shears-cli`, 2 to 15 s for the whole tiny pipeline (the first run compiles Metal kernels), under 2 minutes in all including the transformers cell.
 - **Not run on Colab, and not run on x86_64 Linux in the notebook.** The Linux cells are the commands below, assembled; the pieces were run on an x86_64 Ubuntu 24.04 machine, the assembled notebook was not. Colab's image (Ubuntu 22.04 or 24.04, its Python and preinstalled packages) has not been tried; on 22.04 the notebook adds a PPA for `libstdc++-13`, which is untested.
 - **Setup time on Colab is unmeasured.** From the 4-core x86_64 numbers below (library about 2 min, release CLI about 5.5 min cold) expect 15 to 30 minutes on Colab's 2 vCPUs, mostly the MLX C++ build.
 - **The checkout directory must be called `Shears`.** SwiftPM names a path dependency after its directory, so `CLI/Package.swift`'s `.package(path: "..")` only resolves when the directory is `Shears`. The notebook copies or clones into `<work>/Shears` for that reason.
