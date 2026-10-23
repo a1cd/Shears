@@ -98,7 +98,22 @@ final class TeacherPassTests: ShearsTestCase {
         XCTAssertEqual(each.source.teacherLoads, 3 * 4 + 1, "each batch reads the whole block again")
         let a = whole.report!, b = each.report!
         XCTAssertEqual(Set(a.adapters.keys), Set(b.adapters.keys))
-        for (k, v) in b.adapters { assertClose(a.adapters[k]!, v, atol: 1e-5, rtol: 1e-5, k) }
+        // The two runs feed the same rows through the same layers, but the teacher walk batches them differently (per
+        // block: all six rows grouped by length; per batch: two rows at a time), and a float32 matmul's reduction order
+        // depends on the batch shape. On Metal and on macOS's CPU the results are bit-identical; on the Linux CPU
+        // backend (CI: AMD EPYC 7763) two of the six rows differ in the teacher's block ends by ~1e-6 relative
+        // (2.6e-6 at layer 1 where |x| <= 3.1, 4.7e-5 at layer 3 where |x| <= 9.3; the losses agree to 1e-7). Block 0
+        // trains on its own inputs and ends 1e-6 apart, but block 1 trains on those targets and the six steps magnify
+        // the difference: its adapters end up to 4e-4 of the tensor's largest element apart (mlp_down.a: 1.3e-4 of
+        // 0.33; layers.3.experts.up_a: 4.0e-5 of 0.45). So on the CPU the tolerance gets a term of 2e-3 of the tensor's
+        // max |w|, five times the worst measured; a real difference (stale or misplaced targets, padding leaking into
+        // real positions) moves the adapters by orders of magnitude more, and the other tests in this file still compare
+        // the teacher's outputs at 1e-5. Metal keeps the exact tolerance.
+        let cpu = Device.defaultDevice().deviceType == .cpu
+        for (k, v) in b.adapters {
+            let noise: Float = cpu ? 2e-3 * abs(v).max().item(Float.self) : 0
+            assertClose(a.adapters[k]!, v, atol: 1e-5 + noise, rtol: 1e-5, k)
+        }
         for (x, y) in zip(a.blocks, b.blocks) { XCTAssertEqual(x.losses.count, y.losses.count) }
         // The timing line says what it is and splits the pause.
         let line = try XCTUnwrap(whole.log.first { $0.contains("teacher outputs") })
