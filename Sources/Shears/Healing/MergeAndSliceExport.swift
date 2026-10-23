@@ -21,13 +21,27 @@ import MLXNN
 public enum MergeAndSliceExport {
     public struct Options {
         public var dtype: DType = .bfloat16
-        public var layersPerShard = 5
+        /// Merged layers per output file. The default writes every layer to its own file as soon as it is merged,
+        /// which is what bounds the export's memory to one layer; a larger number holds that many merged
+        /// (kept-expert) layers at a time.
+        public var layersPerShard = 1
         /// The tensor name prefix. `nil` follows the config that is written: `model.language_model.` when the
-        /// source `config.json` is multimodal (has a `text_config`, as `google/gemma-4-26B-A4B-it` does), and
-        /// `model.` for a text-only config, which is what transformers' `Gemma4ForCausalLM` expects.
+        /// config is multimodal (the source `config.json` has a `text_config`, as `google/gemma-4-26B-A4B-it` does
+        /// and ``textOnly`` is off), and `model.` for a text-only config, which is what transformers'
+        /// `Gemma4ForCausalLM` expects.
         public var prefix: String?
+        /// Write a text-only model when the source `config.json` is multimodal: a flat `gemma4_text` config
+        /// (`architectures: ["Gemma4ForCausalLM"]`, no `vision_config`) and `model.` tensor names. transformers then
+        /// loads the export as `Gemma4ForCausalLM`. The multimodal layout (`false`) makes it build
+        /// `Gemma4ForConditionalGeneration`, whose vision tower has no weights in the export and is initialized at
+        /// random: about 0.6 billion parameters of noise that no text prompt touches, and a load report full of
+        /// MISSING keys. Shears' own readers (checkpoint, inference, GGUF) take either layout. A source whose config
+        /// is already flat is unaffected.
+        public var textOnly = false
         /// A directory whose `config.json` and tokenizer files are carried over.
         public var sourceDirectory: URL?
+        /// Progress lines: one per merged layer, with the MLX memory peak so far.
+        public var log: ((String) -> Void)?
         public init() {}
     }
 
@@ -85,16 +99,19 @@ public enum MergeAndSliceExport {
         }
 
         let bank = layer.experts.switchGLU
-        func base(_ p: SwitchLinear) -> MLXArray {
-            if let q = p as? QuantizedSwitchLinear {
-                return dequantized(
-                    q.weight, scales: q.scales, biases: q.biases, groupSize: q.groupSize,
-                    bits: q.bits, mode: q.mode)
-            }
-            return p.weight
-        }
+        // The kept experts only are ever expanded: a quantized bank's packed weights, scales and biases are cut to
+        // the kept rows first and dequantized after (dequantizing is per row, so this is the same numbers), so a
+        // layer of 128 experts never exists in full precision.
         func expert(_ p: SwitchLinear, _ a: MLXArray?, _ b: MLXArray?) -> MLXArray {
-            var w = base(p).take(keep, axis: 0).asType(.float32)
+            var w: MLXArray
+            if let q = p as? QuantizedSwitchLinear {
+                w = dequantized(
+                    q.weight.take(keep, axis: 0), scales: q.scales.take(keep, axis: 0),
+                    biases: q.biases?.take(keep, axis: 0), groupSize: q.groupSize, bits: q.bits, mode: q.mode)
+            } else {
+                w = p.weight.take(keep, axis: 0)
+            }
+            w = w.asType(.float32)
             if let a, let b, let lora = adapters?.experts {
                 w = w + lora.scale * matmul(a, b).swappedAxes(-1, -2)
             }
@@ -119,15 +136,37 @@ public enum MergeAndSliceExport {
         return out
     }
 
+    /// The adapters of model layer `index`, given the layer (all its experts) they are merged into and its
+    /// expert set; `nil` merges nothing into that layer.
+    public typealias LayerAdaptersProvider = (_ index: Int, _ layer: Gemma4MoEDecoderLayer, _ set: ExpertSet) throws -> LayerAdapters?
+
     /// Writes the merged, sliced model.
     ///
-    /// Layers come from `source` one block of ``Options/layersPerShard`` at a time, so the
-    /// export of a model read from a checkpoint directory never holds more than a shard's
-    /// worth of layers.
+    /// The export streams: the layers come from `source` **one at a time**, each is merged and sliced and then
+    /// evaluated, and its source layer is released before the next is loaded; the merged layers are written
+    /// ``Options/layersPerShard`` at a time (default one). The peak is therefore one source layer plus one shard of
+    /// merged (kept-expert) layers, whatever the model's depth, and never the whole model.
     public static func write(
         source: LayerSource, globals: [String: MLXArray], configuration: Gemma4Configuration,
         keep: [[Int]], adapters: ModelAdapters?, scale: Float? = nil, to directory: URL,
         options: Options = .init()
+    ) throws {
+        try write(
+            source: source, globals: { globals }, configuration: configuration, keep: keep,
+            adapterConfiguration: adapters?.configuration,
+            layerAdapters: adapters.map { a in { i, _, _ in a.layers[i - a.firstLayer] } },
+            scale: scale, to: directory, options: options)
+    }
+
+    /// As ``write(source:globals:configuration:keep:adapters:scale:to:options:)``, with the adapters supplied one
+    /// layer at a time (`layerAdapters`; `adapterConfiguration` is their configuration) and the global tensors
+    /// (embedding table, final norm, head) produced by a closure, written first and released before any layer is
+    /// loaded. A caller reading the adapters from a file can then build each layer's from that file's tensors
+    /// and hold none of the others.
+    public static func write(
+        source: LayerSource, globals: () throws -> [String: MLXArray], configuration: Gemma4Configuration,
+        keep: [[Int]], adapterConfiguration: AdapterConfiguration?, layerAdapters: LayerAdaptersProvider?,
+        scale: Float? = nil, to directory: URL, options: Options = .init()
     ) throws {
         let n = configuration.numHiddenLayers
         guard keep.count == n, let kept = keep.first?.count, keep.allSatisfy({ $0.count == kept }) else {
@@ -135,14 +174,14 @@ public enum MergeAndSliceExport {
         }
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        let scale = scale ?? adapters?.configuration.scale ?? 2
+        let scale = scale ?? adapterConfiguration?.scale ?? 2
         // The healed forward pass rounded the merged weight cast to the QAT export dtype; a file in
         // another dtype is a different tensor and would be quantized to different codes.
-        if let qat = adapters?.configuration.qat, qat.exportDType != options.dtype {
+        if let qat = adapterConfiguration?.qat, qat.exportDType != options.dtype {
             throw HealingError.invalid(
                 "the model was healed against weights exported as \(qat.exportDType) but this export writes \(options.dtype)")
         }
-        let p = options.prefix ?? layoutPrefix(options.sourceDirectory)
+        let p = options.prefix ?? layoutPrefix(options.sourceDirectory, textOnly: options.textOnly)
         var weightMap: [String: String] = [:]
         var bytes = 0
         func flush(_ name: String, _ tensors: [String: MLXArray]) throws {
@@ -150,36 +189,45 @@ public enum MergeAndSliceExport {
             try MLX.save(arrays: tensors, metadata: ["format": "pt"], url: directory.appendingPathComponent(name))
             for (k, v) in tensors { weightMap[k] = name; bytes += v.nbytes }
         }
-        var g: [String: MLXArray] = [:]
-        for (k, v) in globals {
-            let hf = k.hasPrefix("model.") ? p + k.dropFirst("model.".count) : k
-            g[hf] = v.asType(options.dtype)
+        do {
+            // Written and released before the first layer is read: the embedding table is the largest single tensor.
+            var g: [String: MLXArray] = [:]
+            for (k, v) in try globals() {
+                let hf = k.hasPrefix("model.") ? p + k.dropFirst("model.".count) : k
+                g[hf] = v.asType(options.dtype)
+            }
+            try flush("model-global.safetensors", g)
         }
-        try flush("model-global.safetensors", g)
-        var first = 0, shard = 0
-        while first < n {
-            let last = min(n - 1, first + options.layersPerShard - 1)
-            let layers = try source.loadLayers(first ... last)
-            var group: [String: MLXArray] = [:]
-            for (j, layer) in layers.enumerated() {
-                let i = first + j
-                guard let l = layer as? Gemma4MoEDecoderLayer else {
+        Memory.clearCache()
+        var formats: [String: QuantFormat] = [:]
+        var group: [String: MLXArray] = [:]
+        var inGroup = 0, shard = 0
+        for i in 0 ..< n {
+            do {
+                guard let l = try source.loadLayers(i ... i)[0] as? Gemma4MoEDecoderLayer else {
                     throw HealingError.invalid("only Gemma 4 MoE layers can be exported")
                 }
                 let set = ExpertSet(keep: keep[i], numExperts: l.numExperts)
-                group.merge(
-                    mergedLayerTensors(
-                        l, index: i, set: set, adapters: adapters.map { $0.layers[i - $0.firstLayer] },
-                        scale: scale, dtype: options.dtype, prefix: p)) { $1 }
+                let la = try layerAdapters?(i, l, set)
+                let merged = mergedLayerTensors(
+                    l, index: i, set: set, adapters: la, scale: scale, dtype: options.dtype, prefix: p)
+                // Evaluated now, so nothing lazy still points at the source layer when it is released.
+                eval(Array(merged.values))
+                group.merge(merged) { $1 }
+                if let la { formats.merge(ExportRecord.formats(of: la, layerIndex: i)) { $1 } }
             }
-            try flush(String(format: "model-layers-%02d.safetensors", shard), group)
             Memory.clearCache()
-            first = last + 1
-            shard += 1
+            options.log?("layer \(i + 1)/\(n) merged, MLX peak so far \(String(format: "%.2f", Double(Memory.peakMemory) / 1_073_741_824)) GB")
+            inGroup += 1
+            if inGroup >= options.layersPerShard || i == n - 1 {
+                try flush(String(format: "model-layers-%02d.safetensors", shard), group)
+                group = [:]
+                inGroup = 0
+                shard += 1
+                Memory.clearCache()
+            }
         }
-        try ExportRecord(
-            dtype: options.dtype, formats: adapters.map { ExportRecord.formats(of: $0) } ?? [:]
-        ).write(to: directory)
+        try ExportRecord(dtype: options.dtype, formats: formats).write(to: directory)
         let index: [String: Any] = ["metadata": ["total_size": bytes], "weight_map": weightMap]
         try JSONSerialization.data(withJSONObject: index, options: [.sortedKeys])
             .write(to: directory.appendingPathComponent("model.safetensors.index.json"))
@@ -212,19 +260,40 @@ public enum MergeAndSliceExport {
     ) throws {
         try write(
             source: Gemma4LayerSource(checkpoint: checkpoint, dtype: loadDType),
-            globals: try checkpoint.loadGlobalTensors(dtype: loadDType),
-            configuration: checkpoint.configuration, keep: keep, adapters: adapters, to: directory,
+            globals: { try checkpoint.loadGlobalTensors(dtype: loadDType) },
+            configuration: checkpoint.configuration, keep: keep, adapterConfiguration: adapters?.configuration,
+            layerAdapters: adapters.map { a in { i, _, _ in a.layers[i - a.firstLayer] } }, to: directory,
             options: options)
     }
 
-    /// `model.language_model.` for a multimodal source config, `model.` for a text-only or absent one.
-    static func layoutPrefix(_ sourceDirectory: URL?) -> String {
-        guard let src = sourceDirectory,
+    /// `model.language_model.` for a multimodal source config (unless the export is ``Options/textOnly``),
+    /// `model.` for a text-only or absent one.
+    static func layoutPrefix(_ sourceDirectory: URL?, textOnly: Bool = false) -> String {
+        guard !textOnly, let src = sourceDirectory,
             let data = try? Data(contentsOf: src.appendingPathComponent("config.json")),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             json["text_config"] != nil
         else { return "model." }
         return "model.language_model."
+    }
+
+    /// The flat config transformers loads as `Gemma4ForCausalLM`: the multimodal config's `text_config` lifted to the
+    /// top, plus the root's settings that still mean something without a vision tower. The vision and audio configs
+    /// are dropped. The root's `eos_token_id` (the list that includes the end-of-turn token) wins over the text
+    /// config's single one, and the root's `*_token_id` / `*_token_index` entries stay, because the GGUF converter
+    /// reads the special-token ids from the config.
+    static func textOnlyConfig(root: [String: Any], text: [String: Any]) -> [String: Any] {
+        var flat = text
+        flat["architectures"] = ["Gemma4ForCausalLM"]
+        flat["model_type"] = flat["model_type"] ?? "gemma4_text"
+        for (k, v) in root where k != "text_config" && k != "vision_config" && k != "audio_config" {
+            if k == "eos_token_id" || k == "dtype" || k == "transformers_version" || k == "tie_word_embeddings"
+                || ((k.hasSuffix("_token_id") || k.hasSuffix("_token_index")) && flat[k] == nil)
+            {
+                if !(v is NSNull) { flat[k] = v }
+            }
+        }
+        return flat
     }
 
     private static func writeConfiguration(
@@ -245,6 +314,7 @@ public enum MergeAndSliceExport {
             if var text = root["text_config"] as? [String: Any] {
                 patch(&text)
                 root["text_config"] = text
+                if options.textOnly { root = textOnlyConfig(root: root, text: text) }
             } else {
                 patch(&root)
             }

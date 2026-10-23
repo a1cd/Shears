@@ -121,6 +121,24 @@ T = 2700 (0.85 GB) and the uncut layer that is counted while it is cut (file-bac
 smaller adapters, a shorter sequence, or optimizer state in a smaller dtype, which would change results and is
 not offered.
 
+## Export streams one layer at a time
+
+`MergeAndSliceExport.write` (and `shears-cli export`) holds one source layer and one output shard at a time. Order:
+the global tensors (embedding table, final norm, head) are produced, cast and written to `model-global.safetensors`, then
+released; then for each layer: load it (mapped, all 128 experts), build its adapters from that layer's own tensors in the
+adapter file (`MergeAndSliceExport.LayerAdaptersProvider`; no model is loaded to learn their shapes), cut the experts to the
+kept ones, merge, evaluate, and write `model-layers-NN.safetensors` (`export.layersPerShard`, default 1; a larger number holds
+that many merged layers). A quantized expert bank is sliced to the kept rows (packed weights, scales and biases) and only
+then dequantized, which gives the same numbers as dequantizing the bank first (dequantization is per row) but never makes
+a 128-expert layer in full precision. The largest single allocation left is the embedding table in the export dtype
+(0.74B parameters, 1.5 GB in bf16 for the 26B), which has to exist whole to be written as one tensor.
+
+Measured with `StreamingExportMemoryTests` (a 4-bit checkpoint, 64 experts of width 192, hidden 512, kept 8, bf16 out; MLX
+peak above the baseline): 42 MB for 6 layers and for 24 layers, where one layer's full-precision bank is 38 MB. The previous
+export on the same checkpoint peaked at 81 MB even with one layer per shard (it dequantized every layer's whole bank before cutting it);
+with its default shard of five layers, and the global tensors and the whole pruned model alive through the run (the CLI loaded it to learn
+the adapters' shapes), its peak grew with the shard and the model.
+
 ## Measured peak memory (M3 Max, fp32 toy, 2026-10-17)
 
 Toy Gemma 4 MoE: hidden 256, 16 experts pruned to 8 (top-2, width 256), dense MLP 512, sequence

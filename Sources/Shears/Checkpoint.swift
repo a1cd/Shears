@@ -69,6 +69,25 @@ public func checkpoint<M: Module>(
     }
 }
 
+/// ``checkpoint(_:_:)`` applied to `x` at once, for a graph that is cached: the recomputation closure that MLX keeps
+/// in the traced graph (and a compiled function keeps in its cache, after the trace is done) holds `module`
+/// **weakly**, and `f` must not capture anything that holds weights either. `module` has to be alive while this
+/// runs, which is when the gradient is taken; the closure is not called after that. A graph that
+/// held the module (and, through `f`, the layer) strongly kept every block's layers alive for as long as the
+/// process ran: the pipeline's memory grew by a block's worth of weights per block.
+func checkpointApplied<M: Module>(_ module: M, _ x: MLXArray, _ f: @escaping (M, MLXArray) -> MLXArray) -> MLXArray {
+    let current = module.trainableParameters().flattened()
+    let keys = current.map(\.0)
+    let originals = current.map { handle(to: $0.1) }
+    let cp = checkpoint { [weak module] inputs in
+        guard let module else { fatalError("checkpoint: the module was released before its recomputation") }
+        module.update(parameters: ModuleParameters.unflattened(Array(zip(keys, inputs.dropFirst()))))
+        defer { module.update(parameters: ModuleParameters.unflattened(Array(zip(keys, originals)))) }
+        return [f(module, inputs[0])]
+    }
+    return cp([x] + originals)[0]
+}
+
 /// A new MLXArray object backed by the same array as `a` (mlx-swift's internal
 /// `copyContext`, built from public API).
 func handle(to a: MLXArray) -> MLXArray {

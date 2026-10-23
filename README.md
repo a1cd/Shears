@@ -37,7 +37,7 @@ Two kinds of evidence, kept apart. The setup, the noise and the limits are in th
 
 ## Status
 
-Healing is ported for Gemma 4 only. The real Gemma 4 26B-A4B has been loaded, pruned, healed and exported on one machine (an M3 Max with 48 GB); the numbers above come from that, and its whole-model quality results are preliminary. Memory was measured on one block; the figures for a whole 26B run in the docs are still estimates ([memory](docs/memory.md#estimate-for-the-real-26b-a4b-derived-not-measured)). Nothing has been run on an iOS or visionOS device or simulator. Linux builds and passes its tests on the CPU backend (one test fails), but no CUDA GPU has been tried ([Linux and Colab](docs/linux.md)). The full list is in [notes and status](docs/notes.md).
+Healing is ported for Gemma 4 only. The real Gemma 4 26B-A4B has been loaded, pruned, healed and exported on one machine (an M3 Max with 48 GB); the numbers above come from that, and its whole-model quality results are preliminary. Memory was measured on one block; the figures for a whole 26B run in the docs are still estimates ([memory](docs/memory.md#estimate-for-the-real-26b-a4b-derived-not-measured)). Nothing has been run on an iOS or visionOS device or simulator. Linux builds and passes its tests on the CPU backend (one test fails), but no CUDA GPU has been tried: CI compiles an experimental CUDA build of `shears-cli`, whose first test on a GPU (a Colab T4) crashed at start-up ([Linux and Colab](docs/linux.md)). The full list is in [notes and status](docs/notes.md).
 
 ## Install
 

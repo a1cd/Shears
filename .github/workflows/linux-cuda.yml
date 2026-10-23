@@ -1,0 +1,322 @@
+name: Linux CUDA (experimental)
+
+# Builds shears-cli for Linux x86_64 with the MLX CUDA backend and publishes it as a PRE-RELEASE. The runner has no GPU:
+# this only COMPILES. Its first test on a GPU (Colab T4, 2026-10-22) crashed at start-up; see docs/linux.md.
+# See docs/linux.md. The CPU binary is built by linux.yml and is untouched by this workflow.
+on:
+  push:
+    branches: [cuda-binary, main]
+    paths:
+      - ".github/workflows/linux-cuda.yml"
+      - ".github/scripts/package-linux-cuda.sh"
+      - ".github/scripts/nvcc-wrapper.sh"
+      - ".github/scripts/ccache-toolchain.sh"
+      - ".github/actions/setup-linux/**"
+      - ".github/actions/setup-cuda/**"
+      - "Sources/**"
+      - "CLI/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - "Notebooks/mlx-swift-linux-cpu.patch"
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: "Compute capabilities to build device code for. Default all three; \"75\" is a quick build for a T4 test (about a third of the nvcc time) and is never published."
+        default: "75 80 90"
+        type: string
+
+concurrency:
+  group: linux-cuda-${{ github.ref }}-${{ inputs.archs }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Colab's GPU image (googlecolab/backend-info, 2026): Ubuntu 24.04, CUDA toolkit 13.0, cuDNN 9.x for CUDA 13.
+  # MLX's CMake path refuses exactly CUDA 13.1; 13.0 is what Colab has, so this is what the binary is linked against
+  # (libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libnvrtc.so.13, libcudnn.so.9).
+  CUDA_PACKAGE_VERSION: "13-0"
+  # Pinned to what Colab has. If the NVIDIA repository no longer carries it the step falls back to the newest and says so.
+  CUDNN_VERSION: "9.14.0.64-1"
+  # Device code generated for these compute capabilities: 75 = T4 (Turing), 80 = A100 (also runs on 8.6 and 8.9: L4, A10),
+  # 90 = H100. MLX chooses its sm_80 and sm_90 kernels at run time from the GPU's compute capability, and their bodies exist
+  # only in device code built for an architecture >= 80, so a build for 75 alone would be wrong (not just slow) on an A100.
+  # PTX for the last one lets newer GPUs (Blackwell) compile at first use.
+  SHEARS_CUDA_ARCHS: ${{ inputs.archs || '75 80 90' }}
+  # Versions MLX's own CMake build pins for the headers its SwiftPM build does not fetch.
+  CUTLASS_TAG: v4.4.2
+  CUDNN_FRONTEND_TAG: v1.16.0
+  CCCL_TAG: v3.1.3
+
+jobs:
+  build:
+    name: Build shears-cli (CUDA 13.0, compile only, static Swift runtime)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-linux
+
+      # CUDA toolkit, the headers SwiftPM does not fetch, the nvcc wrapper. The runner has 80 GB free before the job starts,
+      # so there is no disk to free (the step that did cost 161 s).
+      - uses: ./.github/actions/setup-cuda
+        id: cuda
+
+      # What does not change when only Shears does: MLX's CUDA backend. Cached as the SwiftPM build directory (SwiftPM then
+      # skips every nvcc and clang job whose inputs are unchanged, so only Shears is compiled and linked), plus, underneath
+      # it, two content-addressed caches that do not depend on file times: the nvcc wrapper's (one .cpp per .cu) and ccache's
+      # (every clang compile). If SwiftPM decides to redo work anyway, those make it cost minutes instead of an hour. The key
+      # is what the build depends on (the salt: toolkit, headers, host compiler, MLX, architectures; see setup-cuda) and the
+      # package manifests, not the commit, so one entry is written per combination, by the first run that misses.
+      - name: Restore the CUDA build and compiler caches
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            CLI/.build
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: cuda-build-${{ steps.cuda.outputs.salt }}-${{ hashFiles('Package.swift', 'Package.resolved', 'CLI/Package.swift') }}
+          restore-keys: cuda-build-${{ steps.cuda.outputs.salt }}-
+
+      # The compiler caches alone, written by runs that did not save the entry above (the build failed or was cancelled
+      # after compiling something). A different path list is a different cache, so this never shadows the entry above; its
+      # key is unique per run and the newest one under the prefix is restored, on top of the entry above. Not needed when
+      # the entry above matched exactly: that run's compilers are already in it.
+      - name: Restore the compiler caches kept by earlier failed or cancelled runs
+        id: compilers
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: cuda-compilers-${{ steps.cuda.outputs.salt }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cuda-compilers-${{ steps.cuda.outputs.salt }}-
+
+      # nvcc --threads 3 compiles the architectures of one file in parallel: 1171 s instead of 2147 s for the 98 .cu files
+      # (measured on this runner, nvcc alone, 3 files at once). It also took the runner down to 357 MB of free RAM, which is
+      # why there is swap: running out of memory then slows the build instead of killing it.
+      # The image already has a 3 GB /swapfile that is in use, and `fallocate -l 12G /swapfile` on it fails with "Text file
+      # busy". The first version chained the commands with && under `bash -e`, which does not stop on a failure inside a
+      # chain, so the step went green having done nothing (run 39835532753). Own file, one command per line, and the step
+      # fails unless the swap is really there.
+      - name: Swap file (headroom for nvcc --threads)
+        run: |
+          set -euo pipefail
+          f=/mnt/shears.swap; [ -d /mnt ] || f=/shears.swap
+          df -h "$(dirname "$f")" | tail -1
+          sudo fallocate -l 12G "$f"
+          sudo chmod 600 "$f"
+          sudo mkswap "$f"
+          sudo swapon "$f"
+          free -m
+          swapon --show
+          total=$(free -m | awk '/^Swap:/{print $2}')
+          if [ "$total" -lt 12000 ]; then echo "::error::swap is $total MB, expected at least 12000 (the swap file was not enabled)"; exit 1; fi
+          # redirected completely, or the step would wait for the background loop's stderr pipe
+          ( while sleep 10; do free -m | awk '/Mem:/{a=$7} /Swap:/{u=$3} END{print a, u}'; done ) > "$RUNNER_TEMP/mem.txt" 2>&1 < /dev/null &
+
+      - name: swift build shears-cli (CUDA)
+        id: build
+        working-directory: CLI
+        env:
+          SPM_CUDA: "1"
+          CUDA_ARCH: sm_75   # read by encuda; the wrapper above replaces it
+          SHEARS_NVCC_THREADS: "3"
+        run: |
+          export PATH="$HOME/nvcc-wrapper:/usr/local/cuda/bin:$PATH"
+          export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          command -v nvcc
+          swift package resolve
+          # a restored CLI/.build already records the edit
+          out=$(swift package edit mlx-swift --path "$HOME/mlx-swift" 2>&1) || echo "$out" | grep -q "already in edit mode" || { echo "$out"; exit 1; }
+          start=$(date +%s)
+          ccache -z   # the statistics live in the restored directory: zero them, so the report below counts this run only
+          # nvcc on CUTLASS sources is memory hungry (16 GB runner): cap the parallelism.
+          # fft.cu uses cuFFT; MLX's CMake links it, mlx-swift's manifest does not.
+          export SHEARS_NVCC_LOG="$RUNNER_TEMP/nvcc.log"
+          swift build -c release --product shears-cli --static-swift-stdlib --jobs 3 -Xlinker -L/usr/local/cuda/lib64 -Xlinker -lcufft
+          echo "release build: $(( $(date +%s) - start )) s" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Saved right after the build, so a later failing check does not lose it. Only a miss writes (entries are immutable).
+      - name: Save the CUDA build and compiler caches
+        id: save-build
+        if: always() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            CLI/.build
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      # The compilers' work is worth keeping even when the build does not finish: a cold build is the expensive hour, and a
+      # failure at minute 50 (or a cancel from a newer push) must not throw it away. Saved separately from CLI/.build (a
+      # half-built directory is not worth restoring, the compiler caches are) and only if there is something new in them,
+      # and not when the step above just saved them inside the full entry.
+      - name: Did the compilers do new work?
+        id: fresh
+        if: always() && steps.save-build.outcome != 'success'
+        run: |
+          find "$HOME/.cache/shears-nvcc" -name '.tmp.*' -delete 2>/dev/null || true   # a call killed in the middle of its copy
+          n=$(awk -F'\t' '$4=="miss"' "$RUNNER_TEMP/nvcc.log" 2>/dev/null | wc -l)
+          c=$(ccache --print-stats 2>/dev/null | awk -F'\t' '$1=="cache_miss"{print $2}')
+          echo "nvcc misses: $n, ccache misses: ${c:-unknown}"
+          if [ "$n" -gt 0 ] || [ "${c:-0}" -gt 0 ]; then echo "work=true" >> "$GITHUB_OUTPUT"; else echo "work=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save the compiler caches (build failed or cancelled, or only they changed)
+        if: always() && steps.fresh.outputs.work == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/ccache
+            ~/.cache/shears-nvcc
+          key: cuda-compilers-${{ steps.cuda.outputs.salt }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Cache report
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "### CUDA build cache (restored: ${{ steps.cache.outputs.cache-matched-key || 'nothing' }}; exact hit: ${{ steps.cache.outputs.cache-hit || 'false' }}; compiler caches of earlier failed runs: ${{ steps.compilers.outputs.cache-matched-key || 'none' }})"
+            echo '```'
+            echo "release build: ${{ steps.build.outcome }}"
+            echo "nvcc wrapper: $(awk -F'\t' '$4=="hit"' "$RUNNER_TEMP/nvcc.log" | wc -l) hits, $(awk -F'\t' '$4=="miss"' "$RUNNER_TEMP/nvcc.log" | wc -l) misses"
+            awk -F'\t' '{n[$1" "$4]++; t[$1" "$4]+=$3} END{for(k in n) printf "nvcc %s: %d calls, %.0f s\n", k, n[k], t[k]}' "$RUNNER_TEMP/nvcc.log" | sort
+            ccache -s | grep -E 'Hits|Misses|Cache size'
+            echo "lowest available RAM MB: $(awk '{print $1}' "$RUNNER_TEMP/mem.txt" | sort -n | head -1); most swap used MB: $(awk '{print $2}' "$RUNNER_TEMP/mem.txt" | sort -n | tail -1)"
+            du -sh CLI/.build "$HOME/.cache/ccache" "$HOME/.cache/shears-nvcc"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bundle (NVIDIA libraries are not bundled)
+        run: .github/scripts/package-linux-cuda.sh CLI/.build/release/shears-cli
+
+      - name: The tarball carries the headers MLX's run-time kernel compiler needs (NVRTC, no GPU required)
+        run: |
+          d=$(mktemp -d)
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          # What Colab's image has: the toolkit's include directory without CUTLASS, cuDNN frontend or this build's extras, and the toolkit's own CCCL.
+          fake=$(mktemp -d); stock=$(mktemp -d)
+          (cd "$stock" && apt-get download cuda-cccl-$CUDA_PACKAGE_VERSION >/dev/null && dpkg -x ./*.deb x)
+          stock_cccl=$(find "$stock/x" -type d -path '*include/cccl' | head -1)
+          echo "stock CCCL: $stock_cccl"
+          for e in /usr/local/cuda/include/*; do
+            case "$(basename "$e")" in cute|cutlass|cudnn_frontend*|cudnn_backend_base.h|cuda_jit_sources.h|cccl) ;; *) ln -s "$e" "$fake/";; esac
+          done
+          ln -s "$stock_cccl" "$fake/cccl"
+          python3 -I .github/scripts/check_jit_headers.py "$d/shears-cli-linux-x86_64-cuda" \
+            "$HOME/mlx-swift/Source/Cmlx/mlx/mlx/backend/cuda/device" "$fake" "$stock_cccl" "$(ls /usr/local/cuda/lib64/libnvrtc.so.13)"
+
+      - name: Run on a machine with no GPU (informational, shows what the failure looks like)
+        continue-on-error: true
+        run: |
+          d=$(mktemp -d); stub=$(mktemp -d)
+          ln -s "$(ls /usr/local/cuda/lib64/stubs/libcuda.so)" "$stub/libcuda.so.1"
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          export LD_LIBRARY_PATH="$stub:/usr/local/cuda/lib64"
+          # Expected to fail (no driver, no device); the message is what a user without a GPU would see.
+          "$d/shears-cli-linux-x86_64-cuda/bin/shears-cli" device || echo "exit status $? (expected on a runner without a GPU)"
+
+      - name: The terminate handler reports an exception thrown on a thread (and CI would notice if it did not)
+        run: |
+          d=$(mktemp -d); stub=$(mktemp -d)
+          ln -s "$(ls /usr/local/cuda/lib64/stubs/libcuda.so)" "$stub/libcuda.so.1"
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          export LD_LIBRARY_PATH="$stub:/usr/local/cuda/lib64"
+          out=$(SHEARS_TEST_TERMINATE=1 "$d/shears-cli-linux-x86_64-cuda/bin/shears-cli" --help 2>&1 || true)
+          echo "$out" | head -24
+          echo "$out" | grep -q "what(): test exception from SHEARS_TEST_TERMINATE"
+          echo "$out" | grep -q "backtrace"
+
+      - name: The notebook's gemma configs are accepted by this binary (and a bad one is not)
+        run: |
+          # No GPU and no model here: shears-cli decodes the config first, so a config error shows up before MLX fails on the missing GPU.
+          d=$(mktemp -d); stub=$(mktemp -d)
+          ln -s "$(ls /usr/local/cuda/lib64/stubs/libcuda.so)" "$stub/libcuda.so.1"
+          tar -xzf dist/shears-cli-linux-x86_64-cuda.tar.gz -C "$d"
+          python3 -I - "$d" <<'EOF'
+          import json, sys, types, os, pathlib
+          d = pathlib.Path(sys.argv[1])
+          nb = json.load(open("Notebooks/Shears.ipynb"))
+          src = next("".join(c["source"]) for c in nb["cells"] if "".join(c["source"]).startswith("# 3g.2"))
+          ns = dict(os=os, json=json, subprocess=types.SimpleNamespace(run=None), IS_MAC=False, DEVICE="gpu",
+                    GPU={"name": "T4", "cc": 7.5, "mem_mib": 15360}, GEMMA_STEPS_PER_BLOCK=10, MODEL="gemma", GEMMA_DIR=d, SHEARS_CLI="x")
+          # run the config cell without its dry run: keep everything up to the shears-cli check
+          exec(src.split("    # Does shears-cli accept the config?")[0] + "else:\n    pass\n", ns)
+          bad = dict(ns["GEMMA_CONFIG"], notAKey=1)
+          json.dump(bad, open(d / "config-bad.json", "w"))
+          EOF
+          cd "$d"
+          export LD_LIBRARY_PATH="$stub:/usr/local/cuda/lib64"
+          cli=shears-cli-linux-x86_64-cuda/bin/shears-cli
+          for cfg in config.json config-export.json; do
+            cmd=run; [ "$cfg" = config-export.json ] && cmd=export
+            out=$("$cli" $cmd --config "$cfg" 2>&1 || true)
+            echo "== $cmd --config $cfg"; echo "$out" | tail -3
+            if echo "$out" | grep -qE "shears-cli: config:|DecodingError|keyNotFound|typeMismatch|valueNotFound|dataCorrupted"; then echo "::error::$cfg is not accepted"; exit 1; fi
+          done
+          out=$("$cli" run --config config-bad.json 2>&1 || true)
+          echo "== run --config config-bad.json (must be rejected)"; echo "$out" | tail -3
+          echo "$out" | grep -q "unknown key 'notAKey'"
+
+      - name: Summary
+        run: |
+          f=dist/shears-cli-linux-x86_64-cuda.tar.gz
+          {
+            echo "### shears-cli, Linux x86_64, CUDA (experimental, crashed on its first GPU test)"
+            echo
+            echo "tarball: $(du -h "$f" | cut -f1) ($(stat -c %s "$f") bytes)"
+            echo
+            echo '```'
+            cat "$f.sha256"
+            echo
+            cat dist/shears-cli-linux-x86_64-cuda/BUILD_INFO.txt
+            echo
+            echo "NEEDED entries:"
+            cat dist/needed.txt
+            echo
+            echo "ldd (bundle, libcuda.so.1 via the toolkit stub):"
+            cat dist/ldd.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64-cuda
+          path: |
+            dist/shears-cli-linux-x86_64-cuda.tar.gz
+            dist/shears-cli-linux-x86_64-cuda.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  # Publishing: pushes to cuda-binary and main only, after the build. A PRE-RELEASE, replaced on every run.
+  publish:
+    name: Publish the experimental CUDA tarball (pre-release)
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/cuda-binary' || github.ref == 'refs/heads/main') }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: linux-x86_64-cuda-experimental
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: shears-cli-linux-x86_64-cuda
+          path: artifact
+
+      - name: Publish release assets
+        run: |
+          notes="EXPERIMENTAL and BROKEN so far. shears-cli for Linux x86_64 with the MLX CUDA backend, built from commit $GITHUB_SHA against CUDA 13.0 (Colab's GPU image). It was compiled on a machine with no GPU. Its first test on a GPU (a Colab T4) aborted at start-up with a C++ exception; this build prints the exception text and a backtrace. The NVIDIA libraries are not included: it needs libcuda.so.1 (the driver), libcudart.so.13, libcublas.so.13, libcublasLt.so.13, libnvrtc.so.13 and libcudnn.so.9 on the library path, glibc 2.39 or newer, and g++. Device code for compute capability 7.5, 8.0 and 9.0. Used by Notebooks/Shears.ipynb on a Colab GPU runtime; the CPU build is the release linux-x86_64-latest. See docs/linux.md. Replaced on every push."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --prerelease --notes "$notes"
+          else
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" --title "shears-cli for Linux x86_64, CUDA (experimental, untested)" --notes "$notes"
+          fi
+          gh release upload "$TAG" artifact/shears-cli-linux-x86_64-cuda.tar.gz artifact/shears-cli-linux-x86_64-cuda.tar.gz.sha256 --clobber

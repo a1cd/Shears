@@ -23,9 +23,12 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.5.2"),
     ] + cryptoDependencies,
     targets: [
+        // A std::terminate handler that prints what() and a backtrace (Sources/CShearsDiag).
+        .target(name: "CShearsDiag", path: "Sources/CShearsDiag"),
         .target(
             name: "Shears",
             dependencies: [
+                "CShearsDiag",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),

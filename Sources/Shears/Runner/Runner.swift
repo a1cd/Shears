@@ -1,3 +1,4 @@
+import CShearsDiag
 import Foundation
 import MLX
 import MLXNN
@@ -43,6 +44,9 @@ public enum ShearsRunner {
           gguf      convert the exported directory to a GGUF file
           sample    shears-cli sample <dir>: write a tiny random Gemma 4 MoE (model/) and rows.jsonl into <dir>, to try
                     the commands on with Examples/tiny-config.json (copy it to <dir>/config.json). Needs no --config
+          device    shears-cli device: run one small matrix product on MLX's default device and print which device that
+                    was ("mlx device: gpu" or "mlx device: cpu"). Needs no --config. Every other command prints the same
+                    "mlx device:" line first
 
         options of heal:
           --memory-budget <size>    a ceiling on MLX memory, e.g. 3GB or 512MB. It is only checked: the run needs what
@@ -60,6 +64,7 @@ public enum ShearsRunner {
         """
 
     public static func main(arguments: [String], installSignalHandlers: Bool = true) -> Int32 {
+        shears_install_terminate_handler()
         var args = Array(arguments.dropFirst())
         guard let name = args.first else {
             FileHandle.standardError.write(Data((usage + "\n").utf8))
@@ -70,6 +75,32 @@ public enum ShearsRunner {
             return 0
         }
         args.removeFirst()
+        if name == "device" {
+            // One real op on the default device, so the answer is "what ran", not "what is installed": a build whose
+            // GPU backend cannot start (no driver, a library of the wrong version) fails here, not later.
+            // Every stage goes to standard error, flushed, before it starts, so a crash shows how far it got.
+            func stage(_ text: String) {
+                FileHandle.standardError.write(Data(("device: " + text + "\n").utf8))
+            }
+            stage("choosing MLX's default device")
+            let device = Device.defaultDevice().deviceType.rawValue
+            stage("default device is \(device)")
+            stage("creating a 4x4 array")
+            let x = MLXArray((0 ..< 16).map { Float($0) }, [4, 4])
+            stage("evaluating x + x")
+            let doubled = x + x
+            eval(doubled)
+            stage("evaluating x @ x")
+            let product = matmul(x, x)
+            eval(product)
+            stage("reading the sum back")
+            let sum = product.sum().item(Float.self)
+            print("mlx device: \(device)")
+            print("probe: 4x4 matrix product on \(device), sum \(sum) (expected 3920)")
+            fflush(stdout)
+            stage("done, exiting")
+            return sum == 3920 ? 0 : 1
+        }
         if name == "sample" {
             guard args.count == 1, !args[0].hasPrefix("-") else {
                 FileHandle.standardError.write(Data("usage: shears-cli sample <dir>\n".utf8))
@@ -131,6 +162,7 @@ public enum ShearsRunner {
                 config.stages = config.stages?.map { var s = $0; s.keepIntermediates = keep; return s }
             }
             var env = RunEnvironment()
+            env.log("mlx device: \(Device.defaultDevice().deviceType.rawValue)")
             if installSignalHandlers {
                 let flag = StopSignal.install()
                 env.shouldStop = { flag.requested }
@@ -514,7 +546,8 @@ final class Run {
         let cp = try checkpoint()
         let keep = try keepSets(cp)
         let dtype = try parseDType(c.export?.dtype) ?? .bfloat16
-        var adapters: ModelAdapters?
+        var adapterConfig: AdapterConfiguration?
+        var layerAdapters: MergeAndSliceExport.LayerAdaptersProvider?
         let spec = c.export?.adapters
         if spec != "none" {
             let url: URL
@@ -526,26 +559,44 @@ final class Run {
                 throw RunnerError.config("export needs 'export.adapters' (a file, or 'none') or at least one stage")
             }
             guard fm.fileExists(atPath: url.path) else { throw RunnerError.config("no adapters at \(url.path); run heal first") }
-            let student = try cp.loadModel(keeping: keep, dtype: try loadDType)
             let n = cp.configuration.numExperts ?? 0
-            var ac = try adapterConfiguration(model: student, cp: cp, keptExperts: keep.first?.count ?? 0)
+            var ac = try adapterConfiguration(cp: cp, keptExperts: keep.first?.count ?? 0)
             if ac.qat != nil { ac.qat?.exportDType = dtype }
-            let ma = ModelAdapters(
-                layers: student.healableLayers, sets: keep.map { ExpertSet(keep: $0, numExperts: n) }, configuration: ac)
-            try ma.load(tensors: try loadArrays(url: url))
-            adapters = ma
+            // The file's tensors are lazy handles; each layer's adapters are built from its own tensors when that
+            // layer is merged, so no model is loaded to get their shapes and the others' are never read.
+            let tensors = try loadArrays(url: url)
+            let layers = Set(tensors.keys.compactMap { k -> Int? in
+                let parts = k.split(separator: ".", maxSplits: 2)
+                return parts.count == 3 && parts[0] == "layers" ? Int(parts[1]) : nil
+            })
+            if let extra = layers.max(), extra >= cp.configuration.numHiddenLayers {
+                throw HealingError.adapterMismatch("\(url.path) has adapters for layer \(extra) but the model has \(cp.configuration.numHiddenLayers) layers")
+            }
+            adapterConfig = ac
+            let configuration = ac
+            layerAdapters = { i, layer, _ in
+                let ma = ModelAdapters(
+                    layers: [layer], firstLayer: i, sets: [ExpertSet(keep: keep[i], numExperts: n)], configuration: configuration)
+                try ma.load(subsetOf: tensors)
+                return ma.layers[0]
+            }
         }
         var o = MergeAndSliceExport.Options()
         o.dtype = dtype
         if let x = c.export?.layersPerShard { o.layersPerShard = x }
+        o.textOnly = c.export?.textOnly ?? true
         o.sourceDirectory = c.resolve(c.model)
+        o.log = { self.log("export: \($0)") }
         let target = exportDirectory
         let tmp = target.deletingLastPathComponent().appendingPathComponent(target.lastPathComponent + ".partial")
         try? fm.removeItem(at: tmp)
         try fm.createDirectory(at: tmp.deletingLastPathComponent(), withIntermediateDirectories: true)
-        log("export: merging \(adapters == nil ? "no adapters (pruned model)" : "adapters") into \(keep.first?.count ?? 0) experts per layer, \(dtype)")
+        log("export: merging \(adapterConfig == nil ? "no adapters (pruned model)" : "adapters") into \(keep.first?.count ?? 0) experts per layer, \(dtype), one layer at a time")
+        let loadDType = try loadDType
         try MergeAndSliceExport.write(
-            checkpoint: cp, loadDType: try loadDType, keep: keep, adapters: adapters, to: tmp, options: o)
+            source: Gemma4LayerSource(checkpoint: cp, dtype: loadDType, mapWeights: c.memory?.mapWeights ?? true),
+            globals: { try cp.loadGlobalTensors(dtype: loadDType) }, configuration: cp.configuration, keep: keep,
+            adapterConfiguration: adapterConfig, layerAdapters: layerAdapters, to: tmp, options: o)
         try? fm.removeItem(at: target)
         try fm.moveItem(at: tmp, to: target)
         log("export: wrote \(target.path)")
@@ -615,8 +666,9 @@ final class Progress {
         let process = r.peakFootprintBytes > 0
             ? "  process peak \(gb(r.peakFootprintBytes)) (file-backed pages resident in the process: \(gb(r.fileBackedBytes)))" : ""
         log(String(
-            format: "[%@ %@] step %d/%d  loss %.5f  lr %.3e  %.2f s/step  mlx peak %@%@%@", stage, label, r.step, total,
-            r.loss, r.learningRate, mean, gb(Memory.peakMemory), process, r.applied ? "" : "  (update skipped)"))
+            format: "[%@ %@] step %d/%d  loss %.5f  lr %.3e  this step %.2f s  (mean of the last %d: %.2f s/step)  mlx peak %@%@%@", stage,
+            label, r.step, total, r.loss, r.learningRate, r.seconds, recent.count, mean, gb(Memory.peakMemory), process,
+            r.applied ? "" : "  (update skipped)"))
     }
 }
 

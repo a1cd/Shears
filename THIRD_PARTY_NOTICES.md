@@ -80,3 +80,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## WMT24++ (notebook data)
+
+`Notebooks/data/gemma-en-ja-200.jsonl` contains 200 English segments and their human Japanese reference translations from
+[google/wmt24pp](https://huggingface.co/datasets/google/wmt24pp) (config `en-ja_JP`), distributed under the Apache License 2.0:
+Daniel Deutsch, Eleftheria Briakou, Isaac Caswell, Mara Finkelstein, Rebecca Galor, Juraj Juraska, Geza Kovacs, Alison Lui, Ricardo Rei,
+Jason Riesa, Shruti Rijhwani, Parker Riley, Elizabeth Salesky, Firas Trabelsi, Stephanie Winkler, Biao Zhang and Markus Freitag,
+"WMT24++: Expanding the Language Coverage of WMT24 to 55 Languages & Dialects" (2025, arXiv:2502.12404). The same file holds Japanese
+translations written by Gemma 4 26B-A4B (Apache License 2.0, Google), obtained through OpenRouter. See `Notebooks/data/README.md`.

@@ -24,8 +24,15 @@ extension StreamedBlockHealer {
         1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096,
     ]
 
+    /// One sequence length for every compiled step (and, in ``BlockPipeline``, every teacher walk and frontier batch): a row
+    /// of `T <= fixedSequenceLength` positions runs at exactly this length, so a run meets one shape per function instead of
+    /// one per bucket. For a backend that compiles kernels at run time (MLX's CUDA backend). A row longer than it is
+    /// refused by the pipeline up front. `nil` (the default) uses ``sequenceBuckets``.
+    nonisolated(unsafe) public static var fixedSequenceLength: Int?
+
     /// The bucket a row of `length` positions runs at.
     public static func sequenceBucket(for length: Int) -> Int {
+        if let fixed = fixedSequenceLength, length <= fixed { return fixed }
         let buckets = sequenceBuckets.sorted()
         if let b = buckets.first(where: { $0 >= length }) { return b }
         guard let last = buckets.last, last > 0 else { return length }
@@ -91,6 +98,9 @@ final class CompiledLayerStep {
     }
 
     private var slots: [String: Slot] = [:]
+    nonisolated(unsafe) static var live = 0
+    init() { Self.live += 1 }
+    deinit { Self.live -= 1 }
     /// Times a body was traced (compiled), across every function.
     private(set) var traces = 0
     /// Compiled calls made.
@@ -303,9 +313,11 @@ final class CompiledLayerStep {
                 let set = ctx.sets[j]
                 let sliced = ctx.sliced
                 if j < ctx.recomputed {
-                    h = checkpoint(la) { (m: LayerAdapters, x: MLXArray) in
-                        healingLayerForward(layer, x, set: set, adapters: m, sliced: sliced)
-                    }(h)
+                    // The closure is kept in the cached graph: it reaches the layer through `ctx` (emptied after
+                    // every call), not by capturing the layer, its adapters or the expert set.
+                    h = checkpointApplied(la, h) { [unowned ctx] (m: LayerAdapters, x: MLXArray) in
+                        healingLayerForward(ctx.layers[j], x, set: ctx.sets[j], adapters: m, sliced: ctx.sliced)
+                    }
                 } else {
                     h = healingLayerForward(layer, h, set: set, adapters: la, sliced: sliced)
                 }
