@@ -38,6 +38,8 @@ public enum VocabularyEvaluation {
         public var verdictPrefix = "{\"state\": \""
         public var topK = 64
         public var topP: Float = 0.95
+        /// Generate under the JSON-object constraint (`response_format: json_object`), as the classifier does.
+        public var jsonObject = true
         public init() {}
     }
 
@@ -73,6 +75,10 @@ public enum VocabularyEvaluation {
         public var verdictCandidatesChoice: String?
         /// Probability the full softmax puts on the candidate tokens at the verdict position.
         public var verdictCandidateMass: Double?
+        /// The same scoring after the model's own words up to the verdict (its code fence included), when the free
+        /// generation has a verdict at a candidate token: what the candidates choose, and the mass they hold there.
+        public var verdictNaturalCandidatesChoice: String?
+        public var verdictNaturalCandidateMass: Double?
         // Reference text
         public var referenceTokens: Int?
         public var referenceOutsideSet: Int?
@@ -97,7 +103,17 @@ public enum VocabularyEvaluation {
         public var verdictsParsed: Int
         public var verdictForcedAgreement: Int
         public var verdictForcedPrompts: Int
+        /// Candidate scoring after the forced start, against the verdict the unconstrained free generation wrote.
+        public var verdictForcedCandidatesAgreeWithFree: Int
+        public var verdictForcedCandidatesCompared: Int
+        /// Candidate scoring after the model's own start, against the verdict its free generation wrote.
+        public var verdictNaturalAgreeWithFree: Int
+        public var verdictNaturalCompared: Int
         public var meanVerdictCandidateMass: Double
+        public var meanVerdictNaturalCandidateMass: Double
+        /// What was forced and scored: the text before the verdict, and the candidate tokens (one per verdict).
+        public var verdictStartText: String
+        public var verdictCandidateTokens: [String]
         public var referenceTokens: Int
         public var referenceOutsideSet: Int
         public var referenceOutsideStatic: Int
@@ -117,6 +133,8 @@ public enum VocabularyEvaluation {
         let source = try checkpoint.embeddingRowSource()
         let dtype = model.model.model.norm.weight.dtype
         let window = try VocabularyWindow(source: source, staticIDs: vocabulary.ids, dtype: dtype)
+        let variants = tokenizer.spaceVariantMap()
+        window.contextVariants = variants
         let staticSet = Set(vocabulary.ids)
         let vocab = tokenizer.vocabularySize
         let stop = Set(runtime.defaults.eosTokenIDs)
@@ -137,10 +155,12 @@ public enum VocabularyEvaluation {
         let candidates = fulls.map { common < $0.count ? $0[common] : -1 }
         let candidatesDistinct = !candidates.contains(-1) && Set(candidates).count == candidates.count
         let verdictStart = fulls.first.map { Array($0[..<common]) } ?? []
+        let verdictStartText = tokenizer.decode(verdictStart)
+        let candidateTokenText = candidates.map { tokenizer.token(for: $0) ?? "#\($0)" }
 
         for (n, prompt) in prompts.enumerated() {
             let tokens = try runtime.promptTokens(messages: prompt.messages)
-            let promptSet = Set(tokens)
+            let promptSet = VocabularyWindow.contextSet(tokens, variants: variants)
             var context = promptSet
             let contextOutsideStatic = promptSet.filter { !staticSet.contains($0) }.count
 
@@ -152,12 +172,15 @@ public enum VocabularyEvaluation {
             var outsideStaticF = [Float](repeating: 1, count: vocab)
             for id in staticSet { outsideF[id] = 0; outsideStaticF[id] = 0 }
             for id in promptSet { outsideF[id] = 0 }
+            let jsonConstraint: JSONObjectConstraint? = options.jsonObject
+                ? JSONObjectConstraint(tokenizer: tokenizer, stopTokenIDs: Array(stop), logitsVocabularySize: vocab) : nil
             var generated: [Int] = []
             var stepsOutSet = 0, stepsOutStatic = 0
             var outsideTokens: [String] = []
             var mass: [Double] = [], massStatic: [Double] = [], nucleusMass: [Double] = [], nucleusMassStatic: [Double] = []
             for _ in 0 ..< options.maxNewTokens {
-                let row = logits[0].asType(.float32)
+                var row = logits[0].asType(.float32)
+                if let mask = jsonConstraint?.allowedMask(logits: row) { row = MLX.where(mask, row, MLXArray(-Float.infinity)) }
                 let probs = softmax(row, axis: -1)
                 let m = (probs * MLXArray(outsideF)).sum()
                 let ms = (probs * MLXArray(outsideStaticF)).sum()
@@ -191,6 +214,7 @@ public enum VocabularyEvaluation {
                 nucleusMass.append(out / nucleusTotal)
                 nucleusMassStatic.append(outS / nucleusTotal)
 
+                jsonConstraint?.accept(t)
                 if stop.contains(t) { break }
                 if !staticSet.contains(t) {
                     stepsOutStatic += 1
@@ -213,8 +237,10 @@ public enum VocabularyEvaluation {
             let savedReuse = g.reusesPromptCache
             g.reusesPromptCache = false
             g.resetCache()
+            let windowJSON: JSONObjectConstraint? = options.jsonObject
+                ? JSONObjectConstraint(tokenizer: tokenizer, stopTokenIDs: Array(stop), logitsVocabularySize: vocab) : nil
             let constrained = try g.generate(
-                GenerationRequest(promptTokens: tokens, maxTokens: options.maxNewTokens, stopTokenIDs: stop))
+                GenerationRequest(promptTokens: tokens, maxTokens: options.maxNewTokens, stopTokenIDs: stop, constraint: windowJSON))
             g.reusesPromptCache = savedReuse
             var divergence: Int?
             let shared = min(generated.count, constrained.tokenIDs.count)
@@ -240,6 +266,26 @@ public enum VocabularyEvaluation {
                 if let best = scores.indices.max(by: { scores[$0] < scores[$1] }) { candidatesChoice = options.verdicts[best] }
             }
 
+            // 3b. The same, after the model's own start of its answer (a code fence, whitespace, key order) rather than a forced one.
+            var naturalChoice: String?, naturalMass: Double?
+            if candidatesDistinct {
+                for k in generated.indices where candidates.contains(generated[k]) {
+                    let before = tokenizer.decode(Array(generated[..<k]), skipSpecialTokens: true)
+                    guard before.range(of: #""state"\s*:\s*"$"#, options: .regularExpression) != nil else { continue }
+                    let forced = tokens + Array(generated[..<k])
+                    model.model.vocabularyWindow = nil
+                    let c3 = model.newCache()
+                    let l3 = try g.prefill(forced, cache: c3)[0].asType(.float32)
+                    let mass3 = softmax(l3, axis: -1)[MLXArray(candidates.map(Int32.init))].sum()
+                    eval(mass3)
+                    naturalMass = Double(mass3.item(Float.self))
+                    model.model.vocabularyWindow = window
+                    let scores = try g.candidateScores(promptTokens: forced, candidates: candidates)
+                    if let best = scores.indices.max(by: { scores[$0] < scores[$1] }) { naturalChoice = options.verdicts[best] }
+                    break
+                }
+            }
+
             var rep = PromptReport(
                 id: prompt.id, promptTokens: tokens.count, contextDistinct: promptSet.count,
                 contextOutsideStatic: contextOutsideStatic, generatedTokens: generated.count,
@@ -254,7 +300,8 @@ public enum VocabularyEvaluation {
                 constrainedEqualsUnconstrained: divergence == nil, firstDivergence: divergence,
                 unconstrainedVerdict: verdict(freeText), constrainedVerdict: verdict(constrained.text),
                 verdictForcedFullChoice: forcedFull, verdictCandidatesChoice: candidatesChoice,
-                verdictCandidateMass: candidateMass)
+                verdictCandidateMass: candidateMass, verdictNaturalCandidatesChoice: naturalChoice,
+                verdictNaturalCandidateMass: naturalMass)
             if let ref = prompt.reference {
                 let r = tokenizer.encode(ref)
                 rep.referenceTokens = r.count
@@ -271,6 +318,7 @@ public enum VocabularyEvaluation {
         func mean(_ f: (PromptReport) -> Double) -> Double { reports.isEmpty ? 0 : reports.map(f).reduce(0, +) / Double(reports.count) }
         let parsed = reports.filter { $0.unconstrainedVerdict != nil }
         let forced = reports.filter { $0.verdictForcedFullChoice != nil }
+        let natural = reports.filter { $0.verdictNaturalCandidatesChoice != nil }
         return Summary(
             prompts: reports.count, windowStaticRows: vocabulary.ids.count,
             meanContextOutsideStatic: mean { Double($0.contextOutsideStatic) },
@@ -286,7 +334,15 @@ public enum VocabularyEvaluation {
             verdictsParsed: parsed.count,
             verdictForcedAgreement: forced.filter { $0.verdictForcedFullChoice == $0.verdictCandidatesChoice }.count,
             verdictForcedPrompts: forced.count,
+            verdictForcedCandidatesAgreeWithFree: reports.filter {
+                $0.unconstrainedVerdict != nil && $0.unconstrainedVerdict == $0.verdictCandidatesChoice
+            }.count,
+            verdictForcedCandidatesCompared: reports.filter { $0.unconstrainedVerdict != nil && $0.verdictCandidatesChoice != nil }.count,
+            verdictNaturalAgreeWithFree: natural.filter { $0.unconstrainedVerdict == $0.verdictNaturalCandidatesChoice }.count,
+            verdictNaturalCompared: natural.filter { $0.unconstrainedVerdict != nil }.count,
             meanVerdictCandidateMass: forced.isEmpty ? 0 : forced.compactMap(\.verdictCandidateMass).reduce(0, +) / Double(forced.count),
+            meanVerdictNaturalCandidateMass: natural.isEmpty ? 0 : natural.compactMap(\.verdictNaturalCandidateMass).reduce(0, +) / Double(natural.count),
+            verdictStartText: verdictStartText, verdictCandidateTokens: candidateTokenText,
             referenceTokens: reports.compactMap(\.referenceTokens).reduce(0, +),
             referenceOutsideSet: reports.compactMap(\.referenceOutsideSet).reduce(0, +),
             referenceOutsideStatic: reports.compactMap(\.referenceOutsideStatic).reduce(0, +),

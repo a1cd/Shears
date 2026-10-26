@@ -21,6 +21,8 @@ public enum ServeCommand {
           shears-serve bench --model DIR [--prompt-tokens N] [--decode-tokens N] [--repeats N]
                              [--dtype bf16|float16|float32] [--json]
           shears-serve decode-bench --model DIR --prompts FILE [--index N] [--decode-tokens N] [--repeats N] [--json]
+          shears-serve ab-bench --model DIR --vocab FILE --prompts FILE [--index N] [--decode-tokens N] [--rounds N]
+          shears-serve verdict-bench --model DIR --prompts FILE [--index N] [--repeats N]
           shears-serve generate --model DIR (--prompt TEXT | --prompts FILE [--index N]) [--max-tokens N]
           shears-serve quantize --model DIR --out DIR [--bits 4] [--group-size 64]
           shears-serve vocab-eval --model DIR --vocab FILE --prompts FILE [--out REPORT.json] [--max-new N] [--limit N]
@@ -29,6 +31,7 @@ public enum ServeCommand {
           --vocab FILE          run on a vocabulary window (static list from `shears-cli vocab build`): the embedding table
                                 stays on disk, and only the rows of the static list and of each request's context are read
           --cache-limit-mb N    cap MLX's cache of freed buffers (it otherwise grows without limit and counts in the footprint)
+          --prefill-chunk N     prompt tokens per forward pass during prefill (default 512); smaller lowers the transient peak
         """
 
     public static func main(arguments: [String]) -> Int32 {
@@ -56,6 +59,8 @@ public enum ServeCommand {
             case "bench": return try bench(options, json: flags.contains("json"))
             case "decode-bench": return try decodeBench(options, json: flags.contains("json"))
             case "generate": return try generate(options)
+            case "verdict-bench": return try verdictBench(options)
+            case "ab-bench": return try abBench(options)
             case "quantize": return try quantizeCommand(options)
             case "vocab-eval": return try vocabEval(options)
             case "-h", "--help", "help":
@@ -93,6 +98,10 @@ public enum ServeCommand {
         let rt = try InferenceRuntime.load(
             directory: dir, dtype: try dtype(o["dtype"]), tokenizerDirectory: o["tokenizer"].map { URL(fileURLWithPath: $0) },
             vocabulary: vocabulary)
+        if let c = o["prefill-chunk"] {
+            guard let n = Int(c), n > 0 else { throw UsageError(message: "bad --prefill-chunk") }
+            rt.generator.prefillChunk = n
+        }
         return (rt, dir)
     }
 
@@ -122,6 +131,84 @@ public enum ServeCommand {
         return 0
     }
 
+    /// The same model with its whole table (A) and on a vocabulary window (B), in one process, alternating, so both see the
+    /// same machine load: prefill and decode speed of each, the median over `rounds` rounds.
+    private static func abBench(_ o: [String: String]) throws -> Int32 {
+        guard o["vocab"] != nil else { throw UsageError(message: "--vocab is required") }
+        var plain = o
+        plain["vocab"] = nil
+        let (a, _) = try load(plain)
+        let (b, _) = try load(o)
+        let prompt = try promptTokens(a, o)
+        let decode = try int(o, "decode-tokens", 80), rounds = try int(o, "rounds", 7)
+        func once(_ rt: InferenceRuntime) throws -> (prefill: Double, decode: Double, ttft: Double) {
+            rt.generator.reusesPromptCache = false
+            rt.generator.resetCache()
+            var first: Date?
+            let start = Date()
+            let r = try rt.generator.generate(GenerationRequest(promptTokens: prompt, maxTokens: decode)) { _ in
+                if first == nil { first = Date() }
+                return true
+            }
+            return (Double(prompt.count) / r.promptSeconds, Double(max(1, r.completionTokenCount - 1)) / r.decodeSeconds,
+                    (first ?? start).timeIntervalSince(start))
+        }
+        _ = try once(a); _ = try once(b)
+        var sa: [(Double, Double, Double)] = [], sb: [(Double, Double, Double)] = []
+        for i in 0 ..< rounds {
+            if i % 2 == 0 { let x = try once(a); sa.append((x.prefill, x.decode, x.ttft)); let y = try once(b); sb.append((y.prefill, y.decode, y.ttft)) }
+            else { let y = try once(b); sb.append((y.prefill, y.decode, y.ttft)); let x = try once(a); sa.append((x.prefill, x.decode, x.ttft)) }
+        }
+        func median(_ v: [Double]) -> Double { let s = v.sorted(); return s[s.count / 2] }
+        func line(_ name: String, _ s: [(Double, Double, Double)]) {
+            print(name + String(format: ": prefill %.0f tok/s (%.0f to %.0f), decode %.1f tok/s (%.1f to %.1f), time to first token %.2f s", median(s.map { $0.0 }),
+                s.map { $0.0 }.min()!, s.map { $0.0 }.max()!, median(s.map { $0.1 }), s.map { $0.1 }.min()!, s.map { $0.1 }.max()!, median(s.map { $0.2 })))
+        }
+        print("\(prompt.count)-token prompt, \(decode) tokens, median of \(rounds) alternating rounds (min to max)")
+        line("whole table      ", sa)
+        line("vocabulary window", sb)
+        return 0
+    }
+
+    /// Time to a verdict: prefill and the first token's logits over the whole vocabulary (or the window), against prefill
+    /// and the scores of just the four verdict tokens.
+    private static func verdictBench(_ o: [String: String]) throws -> Int32 {
+        let (rt, _) = try load(o)
+        let prompt = try promptTokens(rt, o)
+        let repeats = try int(o, "repeats", 5)
+        let tok = rt.tokenizer
+        let fulls = ["ON_TASK", "NOT_ALIGNED", "IDLE", "NO_TASK"].map { tok.encode("{\"state\": \"" + $0) }
+        var common = 0
+        while common < fulls[0].count, fulls.allSatisfy({ common < $0.count && $0[common] == fulls[0][common] }) { common += 1 }
+        let candidates = fulls.map { $0[common] }
+        let start = prompt + Array(fulls[0][..<common])
+        let g = rt.generator
+        func time(_ body: () throws -> Void) rethrows -> Double {
+            var best = Double.infinity, total = 0.0
+            try body() // warm-up
+            for _ in 0 ..< repeats {
+                let t = Date()
+                try body()
+                let d = Date().timeIntervalSince(t)
+                best = min(best, d); total += d
+            }
+            return total / Double(repeats)
+        }
+        Memory.clearCache()
+        let full = try time {
+            try rt.model.prepareVocabulary(promptTokens: start)
+            let cache = rt.model.newCache()
+            let l = try g.prefill(start, cache: cache)
+            eval(l)
+            _ = argMax(l[0], axis: -1).item(Int.self)
+        }
+        let four = try time { _ = try g.candidateScores(promptTokens: start, candidates: candidates) }
+        print("prompt \(start.count) tokens; logits over the \(rt.model.vocabularyWindow.map { "\($0.rowCount)-row window" } ?? "whole vocabulary"): "
+              + String(format: "%.3f s", full) + "; the four verdict tokens only: " + String(format: "%.3f s", four))
+        print("peak MLX \(Memory.peakMemory >> 20) MB, footprint \(ProcessMemory.snapshot().footprint >> 20) MB")
+        return 0
+    }
+
     private static func generate(_ o: [String: String]) throws -> Int32 {
         let (rt, _) = try load(o)
         let tokens: [Int]
@@ -132,10 +219,11 @@ public enum ServeCommand {
         }
         let r = try rt.generator.generate(rt.request(promptTokens: tokens, maxTokens: try int(o, "max-tokens", 120))) { _ in true }
         print(r.text)
-        FileHandle.standardError.write(Data(String(
-            format: "\n[%d prompt tokens in %.2fs, %d new tokens in %.2fs (%.1f tok/s), finish %@]\n", r.promptTokenCount,
-            r.promptSeconds, r.completionTokenCount, r.decodeSeconds,
-            r.decodeSeconds > 0 ? Double(max(0, r.completionTokenCount - 1)) / r.decodeSeconds : 0, r.finishReason.rawValue).utf8))
+        let rate = r.decodeSeconds > 0 ? Double(max(0, r.completionTokenCount - 1)) / r.decodeSeconds : 0
+        FileHandle.standardError.write(Data((
+            "\n[\(r.promptTokenCount) prompt tokens in " + String(format: "%.2f", r.promptSeconds)
+                + "s, \(r.completionTokenCount) new tokens in " + String(format: "%.2f", r.decodeSeconds)
+                + "s (" + String(format: "%.1f", rate) + " tok/s), finish \(r.finishReason.rawValue)]\n").utf8))
         return 0
     }
 
@@ -238,8 +326,8 @@ public enum ServeCommand {
         print(String(format: "load      %9.1f s", loadSeconds))
         print(String(format: "prefill   %9.1f tokens/s (%d-token prompt)", r.prefillTokensPerSecond, r.promptTokens))
         print(String(format: "decode    %9.1f tokens/s (%d tokens)", r.decodeTokensPerSecond, r.decodeTokens))
-        print(String(format: "first token %7.3f s (first request %@ s)", r.timeToFirstTokenSeconds,
-                     r.coldTimeToFirstTokenSeconds.map { String(format: "%.3f", $0) } ?? "-"))
+        let cold = r.coldTimeToFirstTokenSeconds.map { String(format: "%.3f", $0) } ?? "-"
+        print(String(format: "first token %7.3f s", r.timeToFirstTokenSeconds) + " (first request \(cold) s)")
         if let w = window {
             print("window    \(w.rowCount) rows (\(w.staticIDs.count) static + \(w.extraIDs.count) from the last request), \(mb(w.residentBytes))")
         }

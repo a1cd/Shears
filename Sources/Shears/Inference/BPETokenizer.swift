@@ -284,6 +284,25 @@ public final class BPETokenizer: @unchecked Sendable {
     /// Ids of `<0x00>` ... `<0xFF>` in byte order (empty when the vocabulary has no byte-fallback tokens).
     public var byteFallbackTokenIDs: [Int] { byteTokenIDs.compactMap { $0 } }
 
+    /// For each token id, the id of the same text with the word-start marker `▁` added (if it lacks one) or
+    /// removed (if it has one), or -1 when the vocabulary has no such token or the token is special. `Claude` and
+    /// `▁Claude` are two tokens: a name written in quotes in a window title is the first, the same name inside a
+    /// sentence is the second.
+    public func spaceVariantMap() -> [Int32] {
+        var out = [Int32](repeating: -1, count: tokenBytes.count)
+        let marker: [UInt8] = Array("\u{2581}".utf8)
+        for (id, bytes) in tokenBytes.enumerated() {
+            guard let bytes, !bytes.isEmpty, !specialIDs.contains(id), byteValueOfID[id] == nil else { continue }
+            if bytes.starts(with: marker) {
+                let rest = Array(bytes.dropFirst(marker.count))
+                if !rest.isEmpty, let v = vocabulary[rest] { out[id] = Int32(v) }
+            } else if let v = vocabulary[marker + bytes] {
+                out[id] = Int32(v)
+            }
+        }
+        return out
+    }
+
     /// A SHA-256 over every token's bytes in id order (and the vocabulary size), so a file made for one
     /// vocabulary can tell it is being used with another.
     public func vocabularyFingerprint() -> String {

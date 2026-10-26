@@ -317,7 +317,25 @@ final class StaticVocabularyTests: ShearsTestCase {
         XCTAssertEqual(b.dictionaryWords, 3)
         let base = b.mandatorySections().reduce(into: Set<Int>()) { $0.formUnion($1.ids) }
         let sel = try b.select(size: base.count + 2)
-        XCTAssertGreaterThan(sel.vocabulary.sections["dictionary"] ?? 0, 0)
-        XCTAssertEqual(sel.vocabulary.sections["corpus"], 0)
+        XCTAssertGreaterThan(b.dictionaryCredit.reduce(0, +), 0)
+        // Nothing was counted from a corpus: whatever the dictionary credits fills the list.
+        XCTAssertEqual(sel.vocabulary.ids.count, base.count + 2)
+        XCTAssertEqual((sel.vocabulary.sections["english"] ?? 0) + (sel.vocabulary.sections["corpus"] ?? 0), 2)
+    }
+}
+
+extension VocabularyWindowTests {
+    /// A constraint that allows nothing the window holds is an error, not token 0.
+    func testAConstraintOutsideTheWindowIsAnError() throws {
+        let e = try makeExport()
+        defer { e.cleanUp() }
+        let windowed = try InferenceRuntime.load(
+            directory: e.directory, dtype: .float32, vocabulary: vocabulary(Array(0 ..< 30), for: e.tokenizer))
+        final class Only: GenerationConstraint {
+            func allowedMask(logits: MLXArray) -> MLXArray? { MLXArray((0 ..< InferenceFixture.vocab).map { $0 == 200 }) }
+            func accept(_ token: Int) {}
+        }
+        XCTAssertThrowsError(
+            try windowed.generator.generate(GenerationRequest(promptTokens: InferenceFixture.prompt(8), maxTokens: 4, constraint: Only())))
     }
 }

@@ -49,6 +49,7 @@ public final class InferenceRuntime {
             module = try checkpoint.loadModel(dtype: dtype)
         }
         eval(module)
+        module.vocabularyWindow?.contextVariants = tokenizer.spaceVariantMap()
         return try make(
             model: try InferenceModel(model: module), tokenizerDirectory: tokenizerDirectory, directory: directory,
             tokenizer: tokenizer)

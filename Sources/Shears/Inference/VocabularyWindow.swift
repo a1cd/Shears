@@ -71,7 +71,21 @@ public final class EmbeddingRowSource {
             let fd = open(t.url.path, O_RDONLY)
             guard fd >= 0 else { throw MoELoaderError.missingFile(t.url) }
             defer { close(fd) }
-            var a = try MappedSafetensors.gatherRows(t.entry, rows: sorted, fd: fd, in: t.url)
+            // In pieces of at most 32 MB: each piece's read buffer is freed as soon as MLX has its copy, so the
+            // process never holds a second copy of all the rows (one big read buffer stayed in the footprint as
+            // malloc'd memory, hundreds of MB for a large window).
+            let rowBytes = max(1, (t.entry.end - t.entry.begin) / max(1, vocabularySize))
+            let perPiece = max(1, (32 << 20) / rowBytes)
+            var pieces: [MLXArray] = []
+            var at = 0
+            while at < sorted.count {
+                let end = min(sorted.count, at + perPiece)
+                pieces.append(try MappedSafetensors.gatherRows(t.entry, rows: Array(sorted[at ..< end]), fd: fd, in: t.url))
+                at = end
+            }
+            var a = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
+            eval(a)
+            pieces.removeAll()
             if order != Array(ids.indices) {
                 var inverse = [Int32](repeating: 0, count: order.count)
                 for (rank, original) in order.enumerated() { inverse[original] = Int32(rank) }
@@ -128,6 +142,17 @@ public struct VocabularyRows {
     }
 }
 
+extension VocabularyWindow {
+    /// The tokens a request's context adds: its own, and (with `variants`) each one's space variant.
+    public static func contextSet(_ tokens: some Sequence<Int>, variants: [Int32]?) -> Set<Int> {
+        var out = Set(tokens)
+        if let variants {
+            for t in out where t < variants.count && variants[t] >= 0 { out.insert(Int(variants[t])) }
+        }
+        return out
+    }
+}
+
 /// The embedding table as a small working set instead of 262,144 rows.
 ///
 /// The full table stays on disk. A window holds
@@ -154,6 +179,10 @@ public final class VocabularyWindow {
     private var extraRows: VocabularyRows?
     /// Dtype of the vectors this window produces.
     public let dtype: DType
+    /// For each token, the same text with the word-start marker added or removed (``BPETokenizer/spaceVariantMap()``),
+    /// -1 for none. When set, ``prepare(contextTokens:)`` also loads the variants of the context's tokens, so a name
+    /// that is written one way on the screen can be written the other way in an answer.
+    public var contextVariants: [Int32]?
 
     public var vocabularySize: Int { source.vocabularySize }
     /// Rows in the window now.
@@ -181,6 +210,7 @@ public final class VocabularyWindow {
         eval(staticRows.weight, map)
         if let s = staticRows.scales { eval(s) }
         if let b = staticRows.biases { eval(b) }
+        Memory.clearCache() // the pieces the rows were assembled from
     }
 
     /// Makes the window cover `contextTokens`: loads the rows of those not in the static base (and drops
@@ -192,6 +222,11 @@ public final class VocabularyWindow {
                 throw InferenceError.invalid("token id \(t) is outside the \(vocabularySize)-token vocabulary")
             }
             if staticMap[t] < 0 { missing.insert(t) }
+        }
+        if let variants = contextVariants {
+            for t in Set(contextTokens) where t < variants.count && variants[t] >= 0 && staticMap[Int(variants[t])] < 0 {
+                missing.insert(Int(variants[t]))
+            }
         }
         let extra = missing.sorted()
         if extra == extraIDs, extraRows != nil || extra.isEmpty { return }

@@ -52,3 +52,8 @@ which is enforced token by token. A reasoning section (`<|channel>thought ... <c
 `reasoning_content`. Unknown request fields are ignored; `n` other than 1, `response_format` `json_schema` and `grammar`
 get a 400. One generation runs at a time; others queue, and `/health` answers meanwhile. `bench` reports prefill and decode
 tokens per second, time to first token, peak MLX memory and peak physical footprint.
+
+**Without the 262K-row embedding table:** `--vocab FILE` (and `InferenceRuntime.load(directory:vocabulary:)`) keeps the table on
+disk and runs on a small window of it: the rows of a static list plus those of each request's context. See
+[Vocabulary subset](vocabulary-subset.md). `shears-serve` also has `decode-bench`, `verdict-bench`, `generate`, `quantize` and
+`vocab-eval` for measuring it.

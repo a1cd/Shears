@@ -21,7 +21,7 @@ public struct StaticVocabulary: Codable, Equatable {
     /// Token ids, ascending, without duplicates.
     public var ids: [Int]
     /// How many ids each always-included section holds (`bytes`, `special`, `json`, `ascii`), and `corpus` and
-    /// `dictionary` for what the ranking added.
+    /// `english` and `corpus` for what the ranking added.
     public var sections: [String: Int]
     public var build: BuildSummary?
 
@@ -79,6 +79,8 @@ public final class StaticVocabularyBuilder {
     public private(set) var heldOutCounts: [Int]
     /// How many dictionary-word forms contain each token.
     public private(set) var dictionaryCredit: [Int]
+    /// How many dictionary-word forms are exactly this one token (a whole English word, or an inflection of one).
+    public private(set) var wholeWordCredit: [Int]
     public private(set) var corpusFiles = 0
     public private(set) var corpusBytes = 0
     public private(set) var dictionaryWords = 0
@@ -89,6 +91,7 @@ public final class StaticVocabularyBuilder {
         counts = Array(repeating: 0, count: n)
         heldOutCounts = Array(repeating: 0, count: n)
         dictionaryCredit = Array(repeating: 0, count: n)
+        wholeWordCredit = Array(repeating: 0, count: n)
     }
 
     // MARK: Always-included tokens
@@ -214,15 +217,49 @@ public final class StaticVocabularyBuilder {
         return out
     }
 
-    /// Credits the tokens that spell each dictionary word: the word alone, after a space, and capitalised after a space.
-    public func addDictionary(words: [String]) {
-        for w in words where !w.isEmpty {
-            dictionaryWords += 1
-            var forms = [w, " " + w, " " + w.prefix(1).uppercased() + w.dropFirst()]
-            if forms[2] == forms[1] { forms.removeLast() }
-            for f in forms {
-                for id in Set(tokenizer.encode(f)) where id < dictionaryCredit.count { dictionaryCredit[id] += 1 }
+    /// Endings tried on every dictionary word, so the tokens of inflected forms ("aligns", "aligned", "aligning") get
+    /// credit though a dictionary lists only "align". Made-up forms cost nothing: they tokenize into pieces already
+    /// credited.
+    public static let inflections = ["", "s", "es", "ed", "d", "ing", "er", "ers", "ly", "est", "ment", "ness"]
+
+    /// Credits the tokens that spell each dictionary word (after a space, lower case and capitalised, with the
+    /// ``inflections``), and separately the tokens that are a whole such form. Run in parallel.
+    public func addDictionary(words: [String], inflect: Bool = true) {
+        let lock = NSLock()
+        let n = tokenizer.vocabularySize
+        let endings = inflect ? Self.inflections : [""]
+        let batch = 2000
+        let batches = (words.count + batch - 1) / batch
+        DispatchQueue.concurrentPerform(iterations: batches) { b in
+            var pieces = [Int32](repeating: 0, count: n)
+            var whole = [Int32](repeating: 0, count: n)
+            var counted = 0
+            for w in words[(b * batch) ..< min(words.count, (b + 1) * batch)] where !w.isEmpty {
+                counted += 1
+                var stems = [w]
+                if w.hasSuffix("e") { stems.append(String(w.dropLast())) }
+                for stem in stems {
+                    for ending in endings {
+                        if stem != w, ending != "ing", ending != "ed", ending != "er", ending != "ers", ending != "est" { continue }
+                        let word = stem + ending
+                        var forms = [word, " " + word]
+                        let capital = " " + word.prefix(1).uppercased() + word.dropFirst()
+                        if capital != forms[1] { forms.append(capital) }
+                        for f in forms {
+                            let ids = tokenizer.encode(f)
+                            for id in Set(ids) where id < n { pieces[id] += 1 }
+                            if ids.count == 1, ids[0] < n { whole[ids[0]] += 1 }
+                        }
+                    }
+                }
             }
+            lock.lock()
+            for id in 0 ..< n {
+                dictionaryCredit[id] += Int(pieces[id])
+                wholeWordCredit[id] += Int(whole[id])
+            }
+            dictionaryWords += counted
+            lock.unlock()
         }
     }
 
@@ -242,6 +279,47 @@ public final class StaticVocabularyBuilder {
         return ids
     }
 
+    /// Whole English words (a token that is a dictionary word or an inflection of one), seen in the corpus first by
+    /// frequency, then the rest by how many forms spell them.
+    public func englishRanking(excluding excluded: Set<Int>) -> [Int] {
+        var ids: [Int] = []
+        for id in 0 ..< counts.count where !excluded.contains(id) && wholeWordCredit[id] > 0 { ids.append(id) }
+        ids.sort { a, b in
+            if counts[a] != counts[b] { return counts[a] > counts[b] }
+            if wholeWordCredit[a] != wholeWordCredit[b] { return wholeWordCredit[a] > wholeWordCredit[b] }
+            return a < b
+        }
+        return ids
+    }
+
+    /// Fills `base` up to `size` ids: `englishShare` of the room from ``englishRanking(excluding:)`` and the rest from
+    /// ``ranking(excluding:)`` (the most frequent tokens of the corpus, whatever they are: code, punctuation, names),
+    /// alternating so the list is balanced at every size. Returns the number taken from each.
+    func fill(_ base: Set<Int>, to size: Int, englishShare: Double) -> (ids: Set<Int>, english: Int, general: Int) {
+        var chosen = base
+        let english = englishRanking(excluding: base)
+        let general = ranking(excluding: base)
+        var ie = 0, ig = 0, takenE = 0, takenG = 0
+        while chosen.count < size {
+            let wantEnglish = Double(takenE) < englishShare * Double(takenE + takenG + 1)
+            var progressed = false
+            if wantEnglish {
+                while ie < english.count, chosen.contains(english[ie]) { ie += 1 }
+                if ie < english.count { chosen.insert(english[ie]); takenE += 1; progressed = true }
+            }
+            if !progressed {
+                while ig < general.count, chosen.contains(general[ig]) { ig += 1 }
+                if ig < general.count { chosen.insert(general[ig]); takenG += 1; progressed = true }
+            }
+            if !progressed {
+                // The preferred list is empty: take from the other one.
+                while ie < english.count, chosen.contains(english[ie]) { ie += 1 }
+                if ie < english.count { chosen.insert(english[ie]); takenE += 1 } else { break }
+            }
+        }
+        return (chosen, takenE, takenG)
+    }
+
     public struct Selection {
         public var vocabulary: StaticVocabulary
         public var mandatoryCount: Int
@@ -250,7 +328,7 @@ public final class StaticVocabularyBuilder {
     }
 
     /// The list of `size` ids: the always-included tokens, then the best-ranked others.
-    public func select(size: Int, extraTexts: [String] = [], note: String? = nil) throws -> Selection {
+    public func select(size: Int, extraTexts: [String] = [], englishShare: Double = 0.5, note: String? = nil) throws -> Selection {
         let sections = mandatorySections(extraTexts: extraTexts)
         var chosen = Set<Int>()
         var sectionCounts: [String: Int] = [:]
@@ -263,14 +341,10 @@ public final class StaticVocabularyBuilder {
             throw InferenceError.invalid("--size \(size) is below the \(chosen.count) tokens that are always included")
         }
         let mandatory = chosen.count
-        var corpusAdded = 0, dictionaryAdded = 0
-        for id in ranking(excluding: chosen) {
-            if chosen.count >= size { break }
-            chosen.insert(id)
-            if counts[id] > 0 { corpusAdded += 1 } else { dictionaryAdded += 1 }
-        }
-        sectionCounts["corpus"] = corpusAdded
-        sectionCounts["dictionary"] = dictionaryAdded
+        let filled = fill(chosen, to: size, englishShare: englishShare)
+        chosen = filled.ids
+        sectionCounts["english"] = filled.english
+        sectionCounts["corpus"] = filled.general
         let corpusTokens = counts.reduce(0, +) + heldOutCounts.reduce(0, +)
         let held = heldOutCoverage(of: chosen)
         let summary = StaticVocabulary.BuildSummary(
@@ -292,14 +366,12 @@ public final class StaticVocabularyBuilder {
     }
 
     /// For each size, the share of held-out (and of training) corpus tokens its list would hold, so a size can be chosen.
-    public func coverage(sizes: [Int], extraTexts: [String] = []) -> [(size: Int, rows: Int, heldOut: Double?, training: Double)] {
+    public func coverage(sizes: [Int], extraTexts: [String] = [], englishShare: Double = 0.5) -> [(size: Int, rows: Int, heldOut: Double?, training: Double)] {
         var base = Set<Int>()
         for (_, ids) in mandatorySections(extraTexts: extraTexts) { base.formUnion(ids) }
-        let ranked = ranking(excluding: base)
         let trainTotal = max(1, counts.reduce(0, +))
         return sizes.sorted().map { size in
-            var set = base
-            for id in ranked { if set.count >= size { break }; set.insert(id) }
+            let set = fill(base, to: size, englishShare: englishShare).ids
             var inside = 0
             for id in set { inside += counts[id] }
             return (size, set.count, heldOutCoverage(of: set), Double(inside) / Double(trainTotal))
