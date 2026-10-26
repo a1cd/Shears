@@ -18,6 +18,18 @@ public struct BenchmarkResult: Codable, Equatable {
     public var peakPhysFootprintBytes: Int
     /// Physical footprint when the runs finished, bytes.
     public var finalPhysFootprintBytes: Int
+    /// Footprint, resident set and MLX active memory just before the first run (the model as loaded, after clearing
+    /// MLX's buffer cache), bytes.
+    public var loadedPhysFootprintBytes: Int?
+    public var loadedResidentBytes: Int?
+    public var loadedMLXActiveBytes: Int?
+    /// Resident set when the runs finished, bytes.
+    public var finalResidentBytes: Int?
+    /// MLX's buffer cache when the runs finished, bytes (freed buffers it keeps for reuse; part of the footprint).
+    public var finalMLXCacheBytes: Int?
+    /// The first request's time to its first token, which includes reading the rows of its context from disk
+    /// for a model on a vocabulary window.
+    public var coldTimeToFirstTokenSeconds: Double?
 }
 
 public enum InferenceBenchmark {
@@ -47,12 +59,30 @@ public enum InferenceBenchmark {
     ) throws -> BenchmarkResult {
         let prompt = syntheticPrompt(
             length: promptTokens, tokenizer: runtime.tokenizer, vocabularySize: runtime.model.configuration.vocabSize)
+        return try run(runtime: runtime, prompt: prompt, decodeTokens: decodeTokens, repeats: repeats)
+    }
+
+    /// As ``run(runtime:promptTokens:decodeTokens:repeats:)`` for a given prompt (for example a real one), generating
+    /// exactly `decodeTokens` tokens whatever the model would have said.
+    public static func run(
+        runtime: InferenceRuntime, prompt: [Int], decodeTokens: Int, repeats: Int = 3
+    ) throws -> BenchmarkResult {
+        let promptTokens = prompt.count
         let generator = runtime.generator
+        Memory.clearCache()
+        let loadedFootprint = ProcessMemory.snapshot().footprint
+        let loadedResident = ProcessMemory.residentBytes()
+        let loadedActive = Memory.activeMemory
         let savedReuse = generator.reusesPromptCache
         generator.reusesPromptCache = false
         defer { generator.reusesPromptCache = savedReuse; generator.resetCache() }
 
-        _ = try generator.generate(GenerationRequest(promptTokens: prompt, maxTokens: 4)) // same shapes, compiles the kernels
+        let coldStart = Date()
+        var coldFirst: Double?
+        _ = try generator.generate(GenerationRequest(promptTokens: prompt, maxTokens: 4)) { _ in // same shapes, compiles the kernels
+            if coldFirst == nil { coldFirst = Date().timeIntervalSince(coldStart) }
+            return true
+        }
         Memory.peakMemory = 0 // resets the peak
         var peakPhys = ProcessMemory.snapshot().footprint
         var prefill = 0.0, decode = 0.0, first = 0.0
@@ -83,6 +113,9 @@ public enum InferenceBenchmark {
             promptTokens: promptTokens, decodeTokens: decodeTokens, repeats: repeats,
             prefillTokensPerSecond: prefill / n, decodeTokensPerSecond: decode / n, timeToFirstTokenSeconds: first / n,
             peakMLXMemoryBytes: Memory.peakMemory, peakPhysFootprintBytes: peakPhys,
-            finalPhysFootprintBytes: ProcessMemory.snapshot().footprint)
+            finalPhysFootprintBytes: ProcessMemory.snapshot().footprint, loadedPhysFootprintBytes: loadedFootprint,
+            loadedResidentBytes: loadedResident, loadedMLXActiveBytes: loadedActive,
+            finalResidentBytes: ProcessMemory.residentBytes(), finalMLXCacheBytes: Memory.cacheMemory,
+            coldTimeToFirstTokenSeconds: coldFirst)
     }
 }

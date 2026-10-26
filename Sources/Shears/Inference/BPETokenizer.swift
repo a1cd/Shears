@@ -278,6 +278,21 @@ public final class BPETokenizer: @unchecked Sendable {
 
     public func isSpecial(_ id: Int) -> Bool { specialIDs.contains(id) }
 
+    /// Ids of the added tokens marked special (`<bos>`, `<turn|>`, ...), ascending.
+    public var specialTokenIDs: [Int] { specialIDs.sorted() }
+
+    /// Ids of `<0x00>` ... `<0xFF>` in byte order (empty when the vocabulary has no byte-fallback tokens).
+    public var byteFallbackTokenIDs: [Int] { byteTokenIDs.compactMap { $0 } }
+
+    /// A SHA-256 over every token's bytes in id order (and the vocabulary size), so a file made for one
+    /// vocabulary can tell it is being used with another.
+    public func vocabularyFingerprint() -> String {
+        var fp = Fingerprint()
+        fp.add("vocabulary \(tokenBytes.count)")
+        for b in tokenBytes { fp.add(Data(b ?? [])) }
+        return fp.hex
+    }
+
     // MARK: Encode
 
     /// Marks a special token's text as plain text for ``encode(templateOutput:)``. A Unicode noncharacter, so it

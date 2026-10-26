@@ -32,20 +32,33 @@ public final class InferenceRuntime {
     /// - Parameters:
     ///   - dtype: cast floating-point weights to this (quantized tensors are never cast); nil keeps the stored type.
     ///   - tokenizerDirectory: read the tokenizer files from here instead of `directory`.
-    public static func load(directory: URL, dtype: DType? = nil, tokenizerDirectory: URL? = nil) throws -> InferenceRuntime {
+    ///   - vocabulary: when given, the embedding table is not loaded: the model runs on a ``VocabularyWindow`` of it
+    ///     (these rows plus each request's context tokens), read from the files as needed. See
+    ///     `docs/vocabulary-subset.md`.
+    public static func load(
+        directory: URL, dtype: DType? = nil, tokenizerDirectory: URL? = nil, vocabulary: StaticVocabulary? = nil
+    ) throws -> InferenceRuntime {
         let checkpoint = try Gemma4Checkpoint(directory: directory)
-        let module = try checkpoint.loadModel(dtype: dtype)
+        let tokenizerDirectory = tokenizerDirectory ?? directory
+        let tokenizer = try BPETokenizer(directory: tokenizerDirectory)
+        let module: Gemma4TextModel
+        if let vocabulary {
+            try vocabulary.validate(for: tokenizer)
+            module = try checkpoint.loadModel(dtype: dtype, vocabulary: vocabulary)
+        } else {
+            module = try checkpoint.loadModel(dtype: dtype)
+        }
         eval(module)
         return try make(
-            model: try InferenceModel(model: module), tokenizerDirectory: tokenizerDirectory ?? directory,
-            directory: directory)
+            model: try InferenceModel(model: module), tokenizerDirectory: tokenizerDirectory, directory: directory,
+            tokenizer: tokenizer)
     }
 
     /// A runtime over a model already in memory, optionally with its healing adapters left unmerged.
     public static func make(
-        model: InferenceModel, tokenizerDirectory: URL, directory: URL? = nil
+        model: InferenceModel, tokenizerDirectory: URL, directory: URL? = nil, tokenizer prebuilt: BPETokenizer? = nil
     ) throws -> InferenceRuntime {
-        let tokenizer = try BPETokenizer(directory: tokenizerDirectory)
+        let tokenizer = try prebuilt ?? BPETokenizer(directory: tokenizerDirectory)
         let template = try ChatTemplate.load(
             directory: tokenizerDirectory, bosToken: tokenizer.bosToken, eosToken: tokenizer.eosToken)
         var defaults = try GenerationDefaults.load(directory: tokenizerDirectory)

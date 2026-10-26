@@ -118,6 +118,7 @@ public final class Generator {
             throw InferenceError.invalid("prompt of \(prompt.count) tokens does not fit the \(contextLength)-token context")
         }
         let maxNew = max(0, min(request.maxTokens, contextLength - prompt.count))
+        try model.prepareVocabulary(promptTokens: prompt)
 
         // Reuse the longest common prefix of the previous sequence, always leaving one token to run.
         var reused = 0

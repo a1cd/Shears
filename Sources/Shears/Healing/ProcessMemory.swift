@@ -26,6 +26,27 @@ public enum ProcessMemory {
         public var anonymous: Int
     }
 
+    /// The process's resident set (`resident_size`): every page of the process in physical memory, anonymous or
+    /// file-backed, including clean mapped pages that `footprint` leaves out. Bytes; 0 if unavailable.
+    public static func residentBytes() -> Int {
+        #if canImport(Darwin)
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Int(info.resident_size) : 0
+        #else
+        guard let status = try? String(contentsOfFile: "/proc/self/status", encoding: .utf8),
+            let line = status.split(separator: "\n").first(where: { $0.hasPrefix("VmRSS:") }),
+            let kB = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).dropFirst().first.flatMap({ Int($0) })
+        else { return 0 }
+        return kB * 1024
+        #endif
+    }
+
     #if canImport(Darwin)
     public static func snapshot() -> Snapshot {
         var info = task_vm_info_data_t()

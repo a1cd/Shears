@@ -57,9 +57,22 @@ public final class InferenceModel {
     /// Logits `[1, vocab]` for the position after the last of `tokens` (`[1, L]` ids), which continue the
     /// sequence held in `cache`. Only the last position is projected to the vocabulary.
     public func nextLogits(_ tokens: MLXArray, cache: [Gemma4KVCache]) -> MLXArray {
+        model.logits(fromHidden: lastHidden(tokens, cache: cache))[0..., 0, 0...]
+    }
+
+    /// The final-layer hidden state `[1, 1, D]` at the last of `tokens` (before the final norm).
+    public func lastHidden(_ tokens: MLXArray, cache: [Gemma4KVCache]) -> MLXArray {
         let h = hidden(tokens, cache: cache)
-        let last = h[0..., (h.dim(1) - 1)..., 0...]
-        return model.logits(fromHidden: last)[0..., 0, 0...]
+        return h[0..., (h.dim(1) - 1)..., 0...]
+    }
+
+    /// The vocabulary window, when the model runs on one.
+    public var vocabularyWindow: VocabularyWindow? { model.vocabularyWindow }
+
+    /// Gets the model ready for a request whose prompt is `promptTokens`: with a vocabulary window, loads the
+    /// rows of the prompt's tokens the window lacks. A no-op for a model with its whole table.
+    public func prepareVocabulary(promptTokens: [Int]) throws {
+        try model.vocabularyWindow?.prepare(contextTokens: promptTokens)
     }
 
     /// The final-layer hidden states `[1, L, D]` (before the final norm).

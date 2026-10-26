@@ -44,6 +44,8 @@ public enum ShearsRunner {
           gguf      convert the exported directory to a GGUF file
           sample    shears-cli sample <dir>: write a tiny random Gemma 4 MoE (model/) and rows.jsonl into <dir>, to try
                     the commands on with Examples/tiny-config.json (copy it to <dir>/config.json). Needs no --config
+          vocab     shears-cli vocab build|info: build the static token list a vocabulary window starts from (the embedding
+                    table then stays on disk; see docs/vocabulary-subset.md). Needs no --config
           device    shears-cli device: run one small matrix product on MLX's default device and print which device that
                     was ("mlx device: gpu" or "mlx device: cpu"). Needs no --config. Every other command prints the same
                     "mlx device:" line first
@@ -101,6 +103,7 @@ public enum ShearsRunner {
             stage("done, exiting")
             return sum == 3920 ? 0 : 1
         }
+        if name == "vocab" { return VocabularyCommand.main(args) }
         if name == "sample" {
             guard args.count == 1, !args[0].hasPrefix("-") else {
                 FileHandle.standardError.write(Data("usage: shears-cli sample <dir>\n".utf8))

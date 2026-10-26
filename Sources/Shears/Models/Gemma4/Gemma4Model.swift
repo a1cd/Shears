@@ -187,19 +187,54 @@ open class Gemma4TextModel: Module {
 
     public var layers: [Gemma4DecoderLayer] { model.layers }
 
+    /// When set, the model's embedding table is this small working set instead of the whole `embed_tokens`
+    /// (which a model loaded for it does not hold): the input side embeds from the window's rows and the
+    /// output side scores only the window's tokens, every other token's logit being `-inf`. See
+    /// ``VocabularyWindow``. Not a parameter; inference only.
+    public var vocabularyWindow: VocabularyWindow?
+
     /// `embed_tokens(tokens) * sqrt(hidden_size)`: the hidden state entering layer 0.
     public func embed(_ tokens: MLXArray) -> MLXArray {
-        model.embedTokens(tokens) * Float(configuration.hiddenSize).squareRoot()
+        let scale = Float(configuration.hiddenSize).squareRoot()
+        if let w = vocabularyWindow { return w.embed(tokens) * scale }
+        return model.embedTokens(tokens) * scale
     }
 
     /// Final norm, output projection and logit softcapping applied to the last layer's
     /// output.
     public func logits(fromHidden h: MLXArray) -> MLXArray {
         let normed = model.norm(h)
-        var out = lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed)
-        if let cap = configuration.finalLogitSoftcapping, cap > 0 {
-            out = tanh(out / cap) * cap
+        func softcap(_ x: MLXArray) -> MLXArray {
+            guard let cap = configuration.finalLogitSoftcapping, cap > 0 else { return x }
+            return tanh(x / cap) * cap
         }
+        // Softcapping runs on the window's scores, before they are spread to the vocabulary: capping the
+        // `-inf` fill would turn it into -cap.
+        if let w = vocabularyWindow { return w.expand(softcap(w.project(normed))) }
+        return softcap(lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed))
+    }
+
+    /// The scores of just `candidates` for the position(s) in `h`, `[.., candidates.count]`, as ``logits(fromHidden:)``
+    /// computes them (norm, projection, softcap). Reads only those rows of the table.
+    public func candidateLogits(fromHidden h: MLXArray, candidates: [Int]) throws -> MLXArray {
+        let normed = model.norm(h)
+        var out: MLXArray
+        if let w = vocabularyWindow {
+            out = try w.project(normed, onlyTokens: candidates)
+        } else if lmHead != nil || candidates.isEmpty {
+            throw InferenceError.invalid("candidate scoring needs a tied embedding table")
+        } else {
+            let ids = MLXArray(candidates.map(Int32.init))
+            if let q = model.embedTokens as? QuantizedEmbedding {
+                let rows = dequantized(
+                    q.weight[ids], scales: q.scales[ids], biases: q.biases.map { $0[ids] }, groupSize: q.groupSize,
+                    bits: q.bits, mode: q.mode)
+                out = matmul(normed, rows.asType(normed.dtype).T)
+            } else {
+                out = matmul(normed, model.embedTokens.weight[ids].asType(normed.dtype).T)
+            }
+        }
+        if let cap = configuration.finalLogitSoftcapping, cap > 0 { out = tanh(out / cap) * cap }
         return out
     }
 
