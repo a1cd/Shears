@@ -71,21 +71,8 @@ public final class EmbeddingRowSource {
             let fd = open(t.url.path, O_RDONLY)
             guard fd >= 0 else { throw MoELoaderError.missingFile(t.url) }
             defer { close(fd) }
-            // In pieces of at most 32 MB: each piece's read buffer is freed as soon as MLX has its copy, so the
-            // process never holds a second copy of all the rows (one big read buffer stayed in the footprint as
-            // malloc'd memory, hundreds of MB for a large window).
-            let rowBytes = max(1, (t.entry.end - t.entry.begin) / max(1, vocabularySize))
-            let perPiece = max(1, (32 << 20) / rowBytes)
-            var pieces: [MLXArray] = []
-            var at = 0
-            while at < sorted.count {
-                let end = min(sorted.count, at + perPiece)
-                pieces.append(try MappedSafetensors.gatherRows(t.entry, rows: Array(sorted[at ..< end]), fd: fd, in: t.url))
-                at = end
-            }
-            var a = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
-            eval(a)
-            pieces.removeAll()
+            // Read straight into the buffer the rows are used from (no second copy of them is left behind).
+            var a = try MappedSafetensors.gatherRowsInPlace(t.entry, rows: sorted, fd: fd, in: t.url)
             if order != Array(ids.indices) {
                 var inverse = [Int32](repeating: 0, count: order.count)
                 for (rank, original) in order.enumerated() { inverse[original] = Int32(rank) }
@@ -210,7 +197,6 @@ public final class VocabularyWindow {
         eval(staticRows.weight, map)
         if let s = staticRows.scales { eval(s) }
         if let b = staticRows.biases { eval(b) }
-        Memory.clearCache() // the pieces the rows were assembled from
     }
 
     /// Makes the window cover `contextTokens`: loads the rows of those not in the static base (and drops

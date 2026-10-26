@@ -12,7 +12,7 @@ public enum VocabularyCommand {
         usage:
           shears-cli vocab build --tokenizer DIR --corpus PATH [--corpus PATH ...] --out FILE [--size N]
                                  [--dictionary FILE ...] [--max-mb N] [--mandatory-text FILE] [--sizes N,N,...] [--note TEXT]
-                                 [--emit SIZE:FILE ...] [--english-share F]
+                                 [--emit SIZE:FILE ...] [--english-share F] [--no-punctuation true] [--max-file-mb N]
           shears-cli vocab coverage --tokenizer DIR --prompts FILE --vocab FILE [--vocab FILE ...] [--limit N] [--show N]
           shears-cli vocab info FILE [--tokenizer DIR]
 
@@ -21,10 +21,12 @@ public enum VocabularyCommand {
         special tokens, JSON/verdict pieces, every printable ASCII character) first, then the corpus's most frequent
         tokens, then the pieces of --dictionary words (one per line) for broad coverage. Every tenth corpus file is held
         out and the share of its tokens the list holds is reported, also for the --sizes given, to help choose a size.
-        --max-mb limits the corpus read (default 512). --mandatory-text adds the tokens of a text file to the always-included set.
+        --max-mb limits the corpus read (default 512); files over --max-file-mb (default 32) are skipped. --mandatory-text adds the tokens of a text file to the always-included set.
         --english-share F (default 0.5) is the part of the room beyond the always-included tokens given to whole English
         words (a token that is a --dictionary word or an inflection of one, most frequent in the corpus first); the rest
         goes to the corpus's most frequent tokens of any kind (code, punctuation, names).
+        --no-punctuation true leaves out the ~4,400 tokens with no letter or digit in them that are otherwise always included (for a
+        list that only has to score a few verdict tokens).
         --emit SIZE:FILE also writes a list of another size from the same counting pass (lists of different sizes are nested).
 
         coverage reads a JSONL file of {"messages": [...], "reference": "text"} and says, for each --vocab list, how many of
@@ -89,7 +91,8 @@ public enum VocabularyCommand {
         }
         let tokenizer = try BPETokenizer(directory: URL(fileURLWithPath: t))
         let builder = StaticVocabularyBuilder(tokenizer: tokenizer)
-        let files = StaticVocabularyBuilder.corpusFiles(under: corpus.map { URL(fileURLWithPath: $0) })
+        let maxFileMB = one("max-file-mb").flatMap { Int($0) } ?? 32
+        let files = StaticVocabularyBuilder.corpusFiles(under: corpus.map { URL(fileURLWithPath: $0) }, maxFileBytes: maxFileMB << 20)
         log("corpus: \(files.count) files")
         let started = Date()
         builder.addCorpus(files: files, maxTotalBytes: maxMB << 20, log: log)
@@ -105,12 +108,13 @@ public enum VocabularyCommand {
             guard let f = Double(s), f >= 0, f <= 1 else { throw UsageError(message: "bad --english-share") }
             return f
         } ?? 0.5
-        let selection = try builder.select(size: size, extraTexts: extra, englishShare: share, note: one("note"))
+        let punctuation = one("no-punctuation") != "true"
+        let selection = try builder.select(size: size, extraTexts: extra, englishShare: share, punctuation: punctuation, note: one("note"))
         try selection.vocabulary.write(to: URL(fileURLWithPath: out))
         for e in multi["emit"] ?? [] {
             let parts = e.split(separator: ":", maxSplits: 1).map(String.init)
             guard parts.count == 2, let n = Int(parts[0]) else { throw UsageError(message: "bad --emit \(e)") }
-            let other = try builder.select(size: n, extraTexts: extra, englishShare: share, note: one("note"))
+            let other = try builder.select(size: n, extraTexts: extra, englishShare: share, punctuation: punctuation, note: one("note"))
             try other.vocabulary.write(to: URL(fileURLWithPath: parts[1]))
             print("wrote \(parts[1]): \(other.vocabulary.ids.count) tokens")
         }
@@ -118,7 +122,7 @@ public enum VocabularyCommand {
         if selection.shortfall > 0 { print("note: the corpus and dictionary held \(selection.shortfall) fewer candidates than --size asked for") }
         print("sections: " + selection.vocabulary.sections.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", "))
         print("size      rows    training tokens held   held-out tokens held")
-        for c in builder.coverage(sizes: sizes, extraTexts: extra, englishShare: share) {
+        for c in builder.coverage(sizes: sizes, extraTexts: extra, englishShare: share, punctuation: punctuation) {
             let held = c.heldOut.map { String(format: "%.4f", $0) } ?? "-"
             print(String(format: "%-8d %-7d %-22.4f", c.size, c.rows, c.training) + held)
         }

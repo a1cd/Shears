@@ -70,9 +70,12 @@ final class VocabularyWindowTests: ShearsTestCase {
         XCTAssertEqual(window.rowCount, 40)
 
         let tokens = InferenceFixture.prompt(30) // ids 6..<100: many are outside the static list
-        let outside = Set(tokens).filter { $0 >= 40 }
-        XCTAssertFalse(outside.isEmpty)
         try windowed.model.prepareVocabulary(promptTokens: tokens)
+        // The context's tokens and their word-start variants, whichever the static list lacks.
+        let context = VocabularyWindow.contextSet(tokens, variants: window.contextVariants)
+        let outside = context.filter { $0 >= 40 }
+        XCTAssertFalse(outside.isEmpty)
+        XCTAssertTrue(Set(tokens.filter { $0 >= 40 }).isSubset(of: outside))
         XCTAssertEqual(Set(window.extraIDs), outside)
         XCTAssertEqual(window.rowCount, 40 + outside.count)
 
@@ -118,6 +121,27 @@ final class VocabularyWindowTests: ShearsTestCase {
         XCTAssertTrue(sampled.tokenIDs.allSatisfy { allowed.contains($0) })
     }
 
+    /// A name written one way in the context can be written the other way: the word-start variant's row is loaded too.
+    func testContextTokensBringTheirWordStartVariants() throws {
+        let e = try makeExport()
+        defer { e.cleanUp() }
+        let variants = e.tokenizer.spaceVariantMap()
+        guard let t = (50 ..< InferenceFixture.vocab).first(where: { variants[$0] >= 0 }) else {
+            return XCTFail("the toy tokenizer has no ▁ pair")
+        }
+        let v = Int(variants[t])
+        XCTAssertEqual(Int(variants[v]), t, "the pairing is symmetric")
+        let rt = try InferenceRuntime.load(
+            directory: e.directory, dtype: .float32, vocabulary: vocabulary(Array(0 ..< 20), for: e.tokenizer))
+        let w = try XCTUnwrap(rt.model.vocabularyWindow)
+        try rt.model.prepareVocabulary(promptTokens: [t, 5])
+        XCTAssertTrue(w.contains(t) && w.contains(v))
+        XCTAssertEqual(Set(w.extraIDs), VocabularyWindow.contextSet([t, 5], variants: variants).subtracting(Set(0 ..< 20)))
+        w.contextVariants = nil
+        try rt.model.prepareVocabulary(promptTokens: [t, 5])
+        XCTAssertFalse(w.contains(v) && v >= 20)
+    }
+
     /// The extra rows belong to one request: the next request's context replaces them.
     func testExtraRowsFollowTheRequest() throws {
         let e = try makeExport()
@@ -125,6 +149,7 @@ final class VocabularyWindowTests: ShearsTestCase {
         let rt = try InferenceRuntime.load(
             directory: e.directory, dtype: .float32, vocabulary: vocabulary(Array(0 ..< 20), for: e.tokenizer))
         let w = try XCTUnwrap(rt.model.vocabularyWindow)
+        w.contextVariants = nil // only the tokens themselves, for the exact assertions here
         try rt.model.prepareVocabulary(promptTokens: [60, 61, 5, 61])
         XCTAssertEqual(w.extraIDs, [60, 61])
         XCTAssertTrue(w.contains(60) && w.contains(5) && !w.contains(70))
@@ -337,5 +362,28 @@ extension VocabularyWindowTests {
         }
         XCTAssertThrowsError(
             try windowed.generator.generate(GenerationRequest(promptTokens: InferenceFixture.prompt(8), maxTokens: 4, constraint: Only())))
+    }
+}
+
+extension VocabularyWindowTests {
+    /// Reading rows into the buffer they are used from gives the same bytes as the plain gather, for rows that are
+    /// neighbours, apart, repeated and of a size that is not a whole number of pages.
+    func testRowsReadInPlaceEqualRowsGathered() throws {
+        let dir = try InferenceFixture.tempDirectory("rows")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let table = MLXRandom.normal([300, 37]).asType(.bfloat16)
+        let url = dir.appendingPathComponent("t.safetensors")
+        try save(arrays: ["w": table], url: url)
+        let entry = try XCTUnwrap(MappedSafetensors.index(of: url)["w"])
+        let fd = open(url.path, O_RDONLY)
+        defer { close(fd) }
+        for rows in [[0], [3, 4, 5, 200, 299], [7, 7, 8], Array(0 ..< 300)] {
+            let a = try MappedSafetensors.gatherRowsInPlace(entry, rows: rows, fd: fd, in: url)
+            let b = try MappedSafetensors.gatherRows(entry, rows: rows, fd: fd, in: url)
+            XCTAssertEqual(a.shape, [rows.count, 37])
+            XCTAssertTrue((a .== b).all().item(Bool.self), "rows \(rows.prefix(4))")
+            XCTAssertTrue((a .== table[MLXArray(rows.map(Int32.init))]).all().item(Bool.self))
+        }
+        XCTAssertThrowsError(try MappedSafetensors.gatherRowsInPlace(entry, rows: [300], fd: fd, in: url))
     }
 }

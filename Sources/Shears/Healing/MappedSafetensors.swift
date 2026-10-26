@@ -149,6 +149,38 @@ public enum MappedSafetensors {
         return MLXArray(data, [rows.count] + Array(e.shape.dropFirst()), dtype: e.dtype)
     }
 
+    /// As ``gatherRows(_:rows:fd:in:)``, but the rows are read straight into one page-aligned anonymous buffer that
+    /// MLX wraps without copying: the process holds the rows once, in the buffer they are used from, and no
+    /// read buffer is left behind. Falls back to ``gatherRows(_:rows:fd:in:)`` where the system will not share the pages.
+    public static func gatherRowsInPlace(_ e: Entry, rows: [Int], fd: Int32, in url: URL) throws -> MLXArray {
+        guard zeroCopySupported, let n = e.shape.first, n > 0, (e.end - e.begin) % n == 0, !rows.isEmpty else {
+            return try gatherRows(e, rows: rows, fd: fd, in: url)
+        }
+        let rowBytes = (e.end - e.begin) / n
+        for r in rows where r < 0 || r >= n { throw HealingError.invalid("row \(r) out of range 0..<\(n)") }
+        let page = Int(getpagesize())
+        let total = rows.count * rowBytes
+        let length = (total + page - 1) & ~(page - 1)
+        guard let p = mmap(nil, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0), p != mapFailed else {
+            return try gatherRows(e, rows: rows, fd: fd, in: url)
+        }
+        var failed = false
+        var i = 0
+        while i < rows.count {
+            var j = i + 1
+            while j < rows.count, rows[j] == rows[j - 1] + 1 { j += 1 }
+            let want = (j - i) * rowBytes
+            let got = pread(fd, p + i * rowBytes, want, off_t(e.begin + rows[i] * rowBytes))
+            if got != want { failed = true }
+            i = j
+        }
+        guard !failed else {
+            munmap(p, length)
+            throw HealingError.invalid("short read of rows of a tensor in \(url.lastPathComponent)")
+        }
+        return MLXArray(rawPointer: p, [rows.count] + Array(e.shape.dropFirst()), dtype: e.dtype) { munmap(p, length) }
+    }
+
     /// Asks the kernel to start reading the byte ranges into the page cache. Returns at once.
     public static func prefetch(_ entries: [Entry], fd: Int32) {
         let chunk = 1 << 30

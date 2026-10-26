@@ -7,8 +7,8 @@ import Foundation
 ///
 /// - the **byte-fallback** tokens (`<0x00>` ... `<0xFF>`), so any text can be spelled;
 /// - the **special** tokens (`<eos>`, `<turn|>`, ...);
-/// - **JSON, verdict and punctuation** tokens: the pieces of a classifier's answer, the digits, and every
-///   printable ASCII character alone and after a space;
+/// - **JSON, verdict and punctuation** tokens: the pieces of a classifier's answer, the digits, every
+///   printable ASCII character alone and after a space, and every token with no letter or digit in it;
 /// - a **broad English and code base**: the most frequent tokens of a text corpus, then the pieces of a
 ///   dictionary's words, up to a chosen size.
 public struct StaticVocabulary: Codable, Equatable {
@@ -110,8 +110,21 @@ public final class StaticVocabularyBuilder {
         "true false null [] {} , : \" \\ \\n \\\" \\\\ \\u00e9 0123456789 0.0 1.0 0.5 .5 1 0 e E - + .",
     ]
 
-    /// The ids that are always in the list, by section.
-    public func mandatorySections(extraTexts: [String] = []) -> [(name: String, ids: Set<Int>)] {
+    /// Whether a token's text is only whitespace, the word-start marker and ASCII punctuation and symbols: no letters or digits.
+    static func isPunctuationToken(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        for u in text.unicodeScalars {
+            switch u.value {
+            case 0x20 ... 0x2F, 0x3A ... 0x40, 0x5B ... 0x60, 0x7B ... 0x7E, 0x09, 0x0A, 0x0D, 0x2581: continue
+            default: return false
+            }
+        }
+        return true
+    }
+
+    /// The ids that are always in the list, by section. `punctuation` adds every token with no letter or digit in it
+    /// (operators, brackets, runs of spaces or newlines): about 4,400 in Gemma's vocabulary.
+    public func mandatorySections(extraTexts: [String] = [], punctuation: Bool = true) -> [(name: String, ids: Set<Int>)] {
         var out: [(String, Set<Int>)] = []
         out.append(("bytes", Set(tokenizer.byteFallbackTokenIDs)))
         out.append(("special", Set(tokenizer.specialTokenIDs)))
@@ -128,6 +141,13 @@ public final class StaticVocabularyBuilder {
         }
         ascii.formUnion(tokenizer.encode("\n\t\n\n  "))
         out.append(("ascii", ascii))
+        if punctuation {
+            var punct = Set<Int>()
+            for id in 0 ..< tokenizer.vocabularySize {
+                if let t = tokenizer.token(for: id), Self.isPunctuationToken(t) { punct.insert(id) }
+            }
+            out.append(("punctuation", punct))
+        }
         return out
     }
 
@@ -328,8 +348,10 @@ public final class StaticVocabularyBuilder {
     }
 
     /// The list of `size` ids: the always-included tokens, then the best-ranked others.
-    public func select(size: Int, extraTexts: [String] = [], englishShare: Double = 0.5, note: String? = nil) throws -> Selection {
-        let sections = mandatorySections(extraTexts: extraTexts)
+    public func select(
+        size: Int, extraTexts: [String] = [], englishShare: Double = 0.5, punctuation: Bool = true, note: String? = nil
+    ) throws -> Selection {
+        let sections = mandatorySections(extraTexts: extraTexts, punctuation: punctuation)
         var chosen = Set<Int>()
         var sectionCounts: [String: Int] = [:]
         for (name, ids) in sections {
@@ -366,9 +388,11 @@ public final class StaticVocabularyBuilder {
     }
 
     /// For each size, the share of held-out (and of training) corpus tokens its list would hold, so a size can be chosen.
-    public func coverage(sizes: [Int], extraTexts: [String] = [], englishShare: Double = 0.5) -> [(size: Int, rows: Int, heldOut: Double?, training: Double)] {
+    public func coverage(
+        sizes: [Int], extraTexts: [String] = [], englishShare: Double = 0.5, punctuation: Bool = true
+    ) -> [(size: Int, rows: Int, heldOut: Double?, training: Double)] {
         var base = Set<Int>()
-        for (_, ids) in mandatorySections(extraTexts: extraTexts) { base.formUnion(ids) }
+        for (_, ids) in mandatorySections(extraTexts: extraTexts, punctuation: punctuation) { base.formUnion(ids) }
         let trainTotal = max(1, counts.reduce(0, +))
         return sizes.sorted().map { size in
             let set = fill(base, to: size, englishShare: englishShare).ids
