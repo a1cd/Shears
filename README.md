@@ -26,6 +26,7 @@ Two kinds of evidence, kept apart. The setup, the noise and the limits are in th
 - **Quality and speed.** The same held-out loss in every arm (0.366, against 0.368 for the reference recipe). With `fast` keeping, 0.72 s/step against 0.86 s/step for the reference recipe (about 1.2x faster per step). The reference recipe also runs a live teacher pass (+0.35 s/step); Shears computes the teacher once up front, about 0.29 s/step spread over these 50 steps. Counted together that is about 1.0 against 1.2 s/step, so about 1.2x faster end to end, not 2x.
 - **Energy.** Net energy per step (powermetrics, idle subtracted): 9% less than the reference recipe with `fast` keeping, 4% more with mid, 20% more with lowMemory.
 - **Parity with the reference recipe.** The pruned student with the reference recipe's adapters reproduces its outputs exactly. The teacher matches except for float-noise router ties. The Q4_K_M export is byte-identical to `llama-quantize` output, tensor by tensor.
+- **Embedding table off the resident set** (inference, 4-bit and bf16 pruned model, [details](docs/vocabulary-subset.md)): with the 262K-row table left on disk and a 64K-row window of it loaded (plus each request's own context tokens), resident memory dropped by 0.31 GB (4-bit, of a 0.42 GB table) and 1.10 GB (bf16, of 1.48 GB), decode was 3% (4-bit) to 6% (bf16) faster, and window and whole-table decodes matched token for token on 80 of 80 test prompts. On 5,460 logged real classifier replies, 0.16% of tokens fell outside the 64K window plus the request's context (a pessimistic figure: no screen OCR text). Measured on a translator-healed pruned export, not the classifier's own.
 - **A limit.** Training is not lower memory than running the pruned Q4_K_M model in llama.cpp (about 3.7 to 4 GB).
 - **Preliminary, one run, small samples:** healing the whole model for two tasks improved each adapter on its own task, but the translation adapter made other languages worse and the cause is not yet understood ([details](docs/benchmarks.md#whole-model-two-task-run-preliminary)).
 
@@ -90,7 +91,7 @@ TEST_RUNNER_SHEARS_BENCH=1 xcodebuild test -scheme Shears -destination 'platform
 
 ## Docs
 
-[docs/README.md](docs/README.md) is the index: [healing](docs/healing.md), [memory](docs/memory.md), [command line and pipeline](docs/cli.md), [quantization and export](docs/quantization-and-export.md), [Gemma 4](docs/gemma4.md), [inference and serve](docs/inference-and-serve.md), [benchmarks](docs/benchmarks.md), [what's here](docs/library.md), [iOS and visionOS](docs/ios-visionos.md), [Linux and Colab](docs/linux.md), [notes and status](docs/notes.md). Third-party code is credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[docs/README.md](docs/README.md) is the index: [healing](docs/healing.md), [memory](docs/memory.md), [command line and pipeline](docs/cli.md), [quantization and export](docs/quantization-and-export.md), [Gemma 4](docs/gemma4.md), [inference and serve](docs/inference-and-serve.md), [vocabulary subset](docs/vocabulary-subset.md), [benchmarks](docs/benchmarks.md), [what's here](docs/library.md), [iOS and visionOS](docs/ios-visionos.md), [Linux and Colab](docs/linux.md), [notes and status](docs/notes.md). Third-party code is credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 
