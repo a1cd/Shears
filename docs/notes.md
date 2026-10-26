@@ -47,3 +47,4 @@
 - The loader ignores `quantization.mode`, so mxfp4/nvfp4 conversions fail loudly rather than load.
 - For Qwen3-MoE, attention isn't mapped, so healing covers the MoE MLP half of each decoder layer only.
 - The fixed overhead in checkpointing (see [Checkpointing](benchmarks.md#checkpointing)).
+- The vocabulary window ([Vocabulary subset](vocabulary-subset.md)) was measured on a translator-healed pruned export, not the classifier's; it has no labelled quality comparison; the Linux/CUDA/iOS builds of it are untested.

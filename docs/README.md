@@ -10,6 +10,7 @@ The front page is the [README](../README.md). The detail lives here, split by to
 | [Quantization-aware healing and GGUF export](quantization-and-export.md) | Quantization-aware healing, the Q4_K_M export (bit-exact), sampling defaults. |
 | [Gemma 4](gemma4.md) | The Gemma 4 port: layers, config defaults, router, healing, checkpoints, quantized checkpoints. |
 | [Inference and `shears-serve`](inference-and-serve.md) | Tokenizer, chat template, decode, unmerged adapters, and the OpenAI-style server. |
+| [Vocabulary subset](vocabulary-subset.md) | Not keeping the 262K-row embedding table loaded: rows read from disk per request, logits over an allowed set, the tool that builds the static list, and what it measured. |
 | [Benchmarks](benchmarks.md) | The real Gemma 4 26B-A4B runs (memory, speed, energy, parity, a two-task whole-model run), speed on toys, and checkpointing. |
 | [What's here](library.md) | The table of types: what each one does. |
 | [iOS and visionOS](ios-visionos.md) | What builds, and what needs runtime testing. |

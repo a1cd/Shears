@@ -118,6 +118,7 @@ public final class Generator {
             throw InferenceError.invalid("prompt of \(prompt.count) tokens does not fit the \(contextLength)-token context")
         }
         let maxNew = max(0, min(request.maxTokens, contextLength - prompt.count))
+        try model.prepareVocabulary(promptTokens: prompt)
 
         // Reuse the longest common prefix of the previous sequence, always leaving one token to run.
         var reused = 0
@@ -158,6 +159,14 @@ public final class Generator {
         step: for i in 0 ..< maxNew {
             let row = logits[0]
             let mask = request.constraint?.allowedMask(logits: row)
+            if model.vocabularyWindow != nil {
+                // A window scores only its tokens; a constraint that allows none of them would leave every logit at
+                // -inf and the sampler would return token 0. That is an error, not an answer.
+                let usable = mask.map { MLX.where($0, row, MLXArray(-Float.infinity)) } ?? row
+                if usable.asType(.float32).max().item(Float.self) == -Float.infinity {
+                    throw InferenceError.invalid("no token the constraint allows is in the vocabulary window")
+                }
+            }
             let token = sampler.sample(row, allowed: mask)
             var lp: TokenLogprob?
             var top: [TokenLogprob] = []

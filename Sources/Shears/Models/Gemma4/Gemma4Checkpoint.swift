@@ -222,9 +222,9 @@ public final class Gemma4Checkpoint {
         return out
     }
 
-    private func tensors(withPrefix prefix: String) throws -> [String: MLXArray] {
+    private func tensors(withPrefix prefix: String, excluding: (String) -> Bool = { _ in false }) throws -> [String: MLXArray] {
         var out: [String: MLXArray] = [:]
-        for (key, srcs) in sources where key.hasPrefix(prefix) {
+        for (key, srcs) in sources where key.hasPrefix(prefix) && !excluding(key) {
             guard let src = srcs.first else { continue }
             if shardCache[src.file] == nil {
                 shardCache[src.file] = try loadArrays(url: directory.appendingPathComponent(src.file))
@@ -597,5 +597,68 @@ extension Gemma4Checkpoint {
             fp.add(try handle.read(upToCount: n) ?? Data())
         }
         return fp.hex
+    }
+}
+
+extension Gemma4Checkpoint {
+    /// Where the embedding table's rows can be read from, on disk, a row at a time (see ``VocabularyWindow``).
+    /// Nothing of the table is read here.
+    ///
+    /// - Parameter dtype: cast floating-point rows to this when they are read.
+    public func embeddingRowSource(dtype: DType? = nil) throws -> EmbeddingRowSource {
+        func tensor(_ suffix: String) throws -> EmbeddingRowSource.Tensor? {
+            guard let src = sources["model.embed_tokens." + suffix]?.first else { return nil }
+            guard let e = try header(src.file)[src.name] else { throw MoELoaderError.missingKey(src.name) }
+            return .init(entry: e, url: directory.appendingPathComponent(src.file))
+        }
+        guard let weight = try tensor("weight") else { throw MoELoaderError.missingKey("model.embed_tokens.weight") }
+        let scales = try tensor("scales"), biases = try tensor("biases")
+        let v = configuration.vocabSize, d = configuration.hiddenSize
+        guard weight.entry.shape.first == v else {
+            throw MoELoaderError.badConfig(
+                "embed_tokens has \(weight.entry.shape.first ?? 0) rows but the config's vocab_size is \(v)")
+        }
+        var quantization: EmbeddingRowSource.Quantization?
+        if let scales {
+            let scaleCols = scales.entry.shape.last ?? 0, packed = weight.entry.shape.last ?? 0
+            guard scaleCols > 0, d % scaleCols == 0, (32 * packed) % d == 0 else {
+                throw MoELoaderError.badConfig("embed_tokens: scales \(scales.entry.shape) and weight \(weight.entry.shape) do not fit width \(d)")
+            }
+            let group = d / scaleCols, bits = 32 * packed / d
+            let spec = self.quantization?.parameters(for: "model.embed_tokens")
+            if let spec, spec.groupSize != group || spec.bits != bits {
+                throw MoELoaderError.badConfig("embed_tokens: the config's quantization disagrees with the tensor shapes")
+            }
+            quantization = .init(groupSize: group, bits: bits, mode: spec?.mode ?? .affine)
+        } else {
+            guard weight.entry.shape == [v, d] else {
+                throw MoELoaderError.badConfig("embed_tokens has shape \(weight.entry.shape), expected [\(v), \(d)]")
+            }
+        }
+        return EmbeddingRowSource(
+            weight: weight, scales: scales, biases: biases, vocabularySize: v, hiddenSize: d,
+            quantization: quantization, dtype: dtype)
+    }
+
+    /// The whole text model **without its embedding table**: the table stays on disk and the model runs on a
+    /// ``VocabularyWindow`` of it (the rows of `vocabulary` now, those of each request's context as it comes), for
+    /// both embedding the prompt and scoring the next token. Everything else loads as in ``loadModel(dtype:)``.
+    ///
+    /// Needs tied embeddings (Gemma 4's are). The window's vectors have the model's compute type.
+    public func loadModel(dtype: DType? = nil, vocabulary: StaticVocabulary) throws -> Gemma4TextModel {
+        defer { releaseShards() }
+        guard configuration.tieWordEmbeddings else {
+            throw HealingError.invalid("a vocabulary window needs tied embeddings (this model has an lm_head)")
+        }
+        let model = Gemma4TextModel(configuration)
+        // A one-row stand-in, so the full table is never built, loaded or evaluated.
+        model.model.update(modules: ModuleChildren.unflattened([("embed_tokens", Embedding(weight: MLXArray.zeros([1, configuration.hiddenSize])))]))
+        var weights = try tensors(withPrefix: "model.", excluding: { $0.hasPrefix("model.embed_tokens.") })
+        weights["model.embed_tokens.weight"] = MLXArray.zeros([1, configuration.hiddenSize])
+        try apply(weights, to: model, stripping: "", dtype: dtype)
+        let source = try embeddingRowSource(dtype: dtype)
+        model.vocabularyWindow = try VocabularyWindow(
+            source: source, staticIDs: vocabulary.ids, dtype: model.model.norm.weight.dtype)
+        return model
     }
 }
